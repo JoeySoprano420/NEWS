@@ -134,7 +134,7 @@ class Transpiler:
 def main():
     if len(sys.argv) != 3:
         print("Usage: python transpiler.py <input.news> <output.dgm>")
-        sys.exit(1)
+        sys.exit(0)
 
     infile, outfile = sys.argv[1], sys.argv[2]
     with open(infile) as f: src = f.read()
@@ -145,3 +145,37 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # transpiler.py
+
+    import sys, re
+    DIGITS = "0123456789ab"
+    def to_base12(num: int) -> str:
+        if num == 0:
+            return "0"
+        result = []
+        while num > 0:
+            result.append(DIGITS[num % 12])
+            num //= 12
+        return "".join(reversed(result))
+    def from_base12(s: str) -> int:
+        result = 0
+        for ch in s:
+            result = result * 12 + DIGITS.index(ch)
+        return result
+    OPCODES = {
+        "print": 0xA6,
+        "ret":   0x33,
+        "store": 0x03,
+        "add":   0x17,
+        "sub":   0x18,
+        "icmp":  0x15,
+        "br":    0x30,
+        "match.begin": 0x95,
+        "match.case":  0x96,
+        "match.end":   0x97,
+    }
+    REL_OPS = {
+        "==": "eq", "!=": "ne", "<": "lt", ">": "gt", "<=": "le", ">=": "ge"
+    }
+
+
