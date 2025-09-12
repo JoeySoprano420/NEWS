@@ -1,0 +1,4 @@
+string:
+  print("Hello World!")
+end()
+;
