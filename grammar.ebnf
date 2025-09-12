@@ -1,12 +1,197 @@
-program       ::= "string:" { statement } "end()" ";"
-statement     ::= print_stmt | let_stmt | add_stmt | sub_stmt 
-                 | if_stmt | while_stmt | expr_stmt
-print_stmt    ::= "print" "(" STRING ")"
-let_stmt      ::= "let" IDENT "=" NUMBER
-add_stmt      ::= "add" IDENT "," NUMBER
-sub_stmt      ::= "sub" IDENT "," NUMBER
-if_stmt       ::= "if" "(" IDENT relop NUMBER ")" block "endif"
-while_stmt    ::= "while" "(" IDENT relop NUMBER ")" block "endwhile"
-expr_stmt     ::= IDENT "=" expr
-relop         ::= "==" | "!=" | "<" | ">" | "<=" | ">="
-expr          ::= NUMBER | IDENT
+(* Expanded NEWS language grammar (EBNF)
+   - Greatly extended from the original minimal grammar.
+   - Adds full expression precedence, types, functions, modules, patterns,
+     control-flow, data structures, I/O, concurrency primitives, and comments.
+   - Keep tokens near the top for clarity. *)
+
+(* ----------------------
+   Lexical tokens
+   ---------------------- *)
+WHITESPACE    ::= { " " | "\t" | NEWLINE } ;
+NEWLINE       ::= "\r\n" | "\n" | "\r" ;
+DIGIT         ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+HEX_DIGIT     ::= DIGIT | "a" | "b" | "c" | "d" | "e" | "f" | "A" | "B" | "C" | "D" | "E" | "F" ;
+LETTER        ::= "a".."z" | "A".."Z" | "_" ;
+IDENT         ::= LETTER { LETTER | DIGIT } ;
+NUMBER        ::= DIGIT { DIGIT } [ "." DIGIT { DIGIT } ] ;
+STRING        ::= "\"" { CHAR } "\"" | "'" { CHAR } "'" ;
+CHAR          ::= ? any valid string character except quote/backslash ? ;
+BOOL          ::= "true" | "false" ;
+COMMENT_LINE  ::= "#" { any-char-except-newline } NEWLINE ;
+COMMENT_BLOCK ::= "/*" { any-char } "*/" ;
+
+TOKEN         ::= WHITESPACE | COMMENT_LINE | COMMENT_BLOCK ;
+
+(* ----------------------
+   High-level program structure
+   ---------------------- *)
+program       ::= { top_level_decl } ;
+top_level_decl ::= import_decl | const_decl | var_decl | func_decl | type_decl | stmt ";" ;
+
+import_decl   ::= "import" string_literal [ "as" IDENT ] ";" ;
+string_literal::= STRING ;
+
+const_decl    ::= "const" IDENT "=" expr ";" ;
+var_decl      ::= "var" IDENT [ ":" type_expr ] [ "=" expr ] ";" ;
+
+type_decl     ::= "type" IDENT "=" type_expr ";" ;
+
+func_decl     ::= "fn" IDENT "(" [ param_list ] ")" [ "->" type_expr ] block ;
+param_list    ::= param { "," param } ;
+param         ::= IDENT [ ":" type_expr ] [ "=" expr ] ;
+
+block         ::= "{" { stmt ";" } "}" ;
+
+(* ----------------------
+   Statements
+   ---------------------- *)
+stmt          ::= empty_stmt
+                | expr_stmt
+                | let_stmt
+                | assign_stmt
+                | if_stmt
+                | match_stmt
+                | while_stmt
+                | for_stmt
+                | break_stmt
+                | continue_stmt
+                | return_stmt
+                | import_stmt
+                | try_stmt
+                | concurrency_stmt
+                | io_stmt
+                ;
+
+empty_stmt    ::= /* empty */ ;
+
+let_stmt      ::= "let" IDENT [ ":" type_expr ] "=" expr ;
+assign_stmt   ::= lvalue assignment_op expr ;
+assignment_op ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" ;
+
+expr_stmt     ::= expr ;
+
+lvalue        ::= IDENT | index_expr | member_expr ;
+
+break_stmt    ::= "break" ;
+continue_stmt ::= "continue" ;
+return_stmt   ::= "return" [ expr ] ;
+
+import_stmt   ::= "use" string_literal ;
+
+(* ----------------------
+   Control flow
+   ---------------------- *)
+if_stmt       ::= "if" "(" expr ")" block { "elif" "(" expr ")" block } [ "else" block ] ;
+while_stmt    ::= "while" "(" expr ")" block ;
+for_stmt      ::= "for" "(" [ for_init ] ";" [ expr ] ";" [ expr ] ")" block
+               | "for" IDENT "in" expr block ;
+for_init      ::= var_decl | assign_stmt | expr_stmt ;
+
+match_stmt    ::= "match" expr "{" { match_case } [ "default" "=>" block ] "}" ;
+match_case    ::= "case" pattern "=>" block ;
+
+pattern       ::= "_" | NUMBER | STRING | BOOL | IDENT | tuple_pattern | list_pattern ;
+tuple_pattern ::= "(" [ pattern { "," pattern } ] ")" ;
+list_pattern  ::= "[" [ pattern { "," pattern } ] "]" ;
+
+try_stmt      ::= "try" block { "except" "(" IDENT ")" block } [ "finally" block ] ;
+
+(* ----------------------
+   Concurrency & I/O
+   ---------------------- *)
+concurrency_stmt ::= "future" "(" expr ")"  -- create and run a future
+                   | "parallel" "(" expr_list ")"  -- run many tasks
+                   | "sync"  -- wait for all spawned tasks
+                   ;
+
+io_stmt       ::= "print" "(" expr_list ")" | "read" "(" string_literal ")" ;
+
+(* ----------------------
+   Expressions (precedence ordered, highest first)
+   ---------------------- *)
+expr          ::= lambda_expr ;
+
+lambda_expr   ::= "fun" "(" [ param_list ] ")" "=>" expr
+                | logic_or ;
+
+logic_or      ::= logic_and { "||" logic_and } ;
+logic_and     ::= equality { "&&" equality } ;
+
+equality      ::= comparison { ( "==" | "!=" ) comparison } ;
+comparison    ::= bitwise_or { ( "<" | ">" | "<=" | ">=" ) bitwise_or } ;
+
+bitwise_or    ::= bitwise_xor { "|" bitwise_xor } ;
+bitwise_xor   ::= bitwise_and { "^" bitwise_and } ;
+bitwise_and   ::= shift { "&" shift } ;
+
+shift         ::= add_sub { ( "<<" | ">>" ) add_sub } ;
+add_sub       ::= mul_div { ( "+" | "-" ) mul_div } ;
+mul_div       ::= unary { ( "*" | "/" | "%" ) unary } ;
+
+unary         ::= ( "!" | "-" | "~" ) unary | postfix ;
+postfix       ::= primary { postfix_op } ;
+postfix_op    ::= "." IDENT    -- member access
+                | "[" expr "]" -- indexing
+                | "(" [ expr_list ] ")" -- function call
+                ;
+
+primary       ::= NUMBER
+                | STRING
+                | BOOL
+                | IDENT
+                | "(" expr ")"
+                | list_literal
+                | tuple_literal
+                | dict_literal
+                | lambda_expr
+                ;
+
+expr_list     ::= expr { "," expr } ;
+
+list_literal  ::= "[" [ expr_list ] "]" ;
+tuple_literal ::= "(" expr { "," expr } [ "," ] ")" ;
+dict_literal  ::= "{" [ dict_entry { "," dict_entry } ] "}" ;
+dict_entry    ::= expr ":" expr ;
+
+index_expr    ::= primary "[" expr "]" ;
+member_expr   ::= primary "." IDENT ;
+
+assignment_expr ::= lvalue "=" expr ;
+
+(* ----------------------
+   Types
+   ---------------------- *)
+type_expr     ::= "number" | "string" | "bool"
+               | "any"
+               | "void"
+               | IDENT
+               | "List" "<" type_expr ">"
+               | "Tuple" "<" type_expr { "," type_expr } ">"
+               | "Dict" "<" type_expr "," type_expr ">"
+               | "(" type_expr ")"
+               | type_union
+               ;
+
+type_union    ::= type_expr "|" type_expr { "|" type_expr } ;
+
+(* ----------------------
+   Utilities & token-level helpers (not strictly EBNF)
+   ---------------------- *)
+string_escape ::= "\\" ( "\"" | "'" | "n" | "r" | "t" | "\\" ) ;
+
+(* ----------------------
+   Examples (informal)
+   ---------------------- *)
+(* Example program fragments that conform to the grammar:
+   let x: number = 10;
+   let s = "hello";
+   fn add(a: number, b: number) -> number { return a + b; }
+   let r = add(1, 2);
+   if (x > 0) { print("positive"); } else { print("non-positive"); }
+   for (i = 0; i < 10; i += 1) { print(i); }
+   match x {
+     case 0 => { print("zero"); }
+     case 1 => { print("one"); }
+     default => { print("many"); }
+   }
+*)
