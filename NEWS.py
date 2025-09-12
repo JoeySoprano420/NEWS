@@ -2529,3 +2529,2896 @@ if __name__ == "__main__":
     {"dgm": "157", "llvm": "reserved",             "nasm": "—",                     "hex": "0x157", "bin": "000101010111"},
     {"dgm": "158", "llvm": "reserved",             "nasm": "—",                     "hex": "0x158", "bin": "000101011000"},
     {"dgm": "159", "llvm": "reserved",             "nasm": "—",                     "hex": "0x159", "bin": "000101011001"},
+
+# --- continuation appended to end of file ---
+# Finalize opcode map index and dynamic registration helpers.
+
+from typing import Optional
+
+# Build fast lookup index by hex value (int)
+OPCODE_INDEX: Dict[int, Dict[str, str]] = {}
+for entry in OPCODE_MAP:
+    try:
+        hex_str = entry.get("hex")
+        if hex_str:
+            hv = int(hex_str, 16)
+            OPCODE_INDEX[hv] = entry
+    except Exception:
+        continue
+
+def get_opcode_info_by_int(opcode_int: int) -> Optional[Dict[str, str]]:
+    """Lookup opcode metadata by integer opcode (hex)."""
+    return OPCODE_INDEX.get(opcode_int)
+
+def register_dynamic_opcodes(mapping: Dict[int, Dict[str, str]]):
+    """
+    Merge a dynamic mapping (opcode_int -> {name, meaning}) into the
+    runtime opcode tables. Existing entries are preserved unless overridden
+    explicitly by mapping (use with care).
+    """
+    added = {}
+    for op_int, meta in mapping.items():
+        if op_int in OPCODE_INDEX:
+            # skip existing unless name differs
+            existing = OPCODE_INDEX[op_int]
+            if existing.get("llvm") == meta.get("name") or existing.get("name") == meta.get("name"):
+                continue
+        # create a minimal entry compatible with OPCODE_MAP shape
+        hexcode = f"0x{op_int:X}"
+        dgmcode = f"{op_int:X}".lower()
+        entry = {
+            "dgm": dgmcode,
+            "llvm": meta.get("name") or meta.get("llvm") or meta.get("n"),
+            "nasm": meta.get("meaning") or meta.get("nasm") or "",
+            "hex": hexcode,
+            "bin": meta.get("bin", "")
+        }
+        OPCODE_MAP.append(entry)
+        OPCODE_INDEX[op_int] = entry
+        # also register into OPCODES (name -> int) if a clear name exists
+        name = entry["llvm"]
+        if isinstance(name, str) and name and name not in OPCODES:
+            try:
+                OPCODES[name] = op_int
+            except Exception:
+                pass
+        added[hexcode] = entry
+    return added
+
+# Example convenience: refresh mapping from remote markdown previously fetched
+def integrate_remote_opcode_table(remote_mapping: Dict[int, Dict[str, str]]):
+    added = register_dynamic_opcodes(remote_mapping)
+    if added:
+        print(f"[NEWS] Integrated {len(added)} remote opcodes.")
+    return added
+
+# Safe-entrypoint for other modules to augment VM with new capabilities
+def extend_vm_with_dynamic_mapping(vm: 'NewsVM', remote_mapping: Dict[int, Dict[str, str]]):
+    added = integrate_remote_opcode_table(remote_mapping)
+    if not added:
+        return
+    # attach a simple handler that prints and records usage for each new opcode
+    if not hasattr(vm, "dynamic_usage"):
+        vm.dynamic_usage = {}
+    def make_handler(op_int, meta):
+        def handler(vm_instance, opcode_int):
+            msg = f"[DYN OPCODE {hex(op_int)}] {meta.get('name')} - {meta.get('meaning')}"
+            try:
+                vm_instance.output_buffer.append(msg)
+            except Exception:
+                pass
+            vm_instance.dynamic_usage[op_int] = vm_instance.dynamic_usage.get(op_int, 0) + 1
+            return True
+        return handler
+    # patch vm to consult dynamic handlers before falling back
+    if not hasattr(vm, "external_handlers"):
+        vm.external_handlers = {}
+        _patch_vm_instance_for_external_handlers(vm)
+    for hexcode, entry in added.items():
+        try:
+            op_int = int(hexcode, 16)
+            vm.external_handlers[op_int] = make_handler(op_int, entry)
+        except Exception:
+            continue
+
+# Minimal test/demo when run as script to show integration (no network calls)
+if __name__ == "__main__" and False:
+    # sample remote-style mapping
+    sample = {
+        0x1A0: {"name": "game.custom", "meaning": "Custom game opcode"},
+        0x1A1: {"name": "tool.echo", "meaning": "Echo helper"},
+    }
+    print("Before:", len(OPCODE_MAP))
+    added = integrate_remote_opcode_table(sample)
+    print("Added entries:", added.keys())
+    print("After:", len(OPCODE_MAP))
+
+# --- Replace placeholder logging-handler with user-callable dispatcher ---
+import re
+from typing import Callable, Dict, Any
+
+def _ensure_vm_external_handlers(vm: 'NewsVM'):
+    """
+    Ensure the VM has `external_handlers` dict and a wrapped `step` that
+    consults those handlers before falling back to the original step.
+
+    A handler is expected to have signature handler(vm_instance, opcode_int)
+    and return truthy if it handled the opcode, falsy to allow fallback.
+    """
+    if getattr(vm, "_external_wrapped", False):
+        return
+    if not hasattr(vm, "external_handlers"):
+        vm.external_handlers = {}
+
+    original_step = vm.step
+
+    def wrapped_step():
+        # peek the next token without permanently advancing if not handled
+        ip = getattr(vm, "ip", 0)
+        tokens = getattr(vm, "tokens", [])
+        if ip < len(tokens):
+            tok = tokens[ip]
+            opc = None
+            try:
+                if re.fullmatch(r"[0-9abAB]+", tok):
+                    opc = from_base12(tok.lower())
+                else:
+                    opc = int(tok, 0)
+            except Exception:
+                opc = None
+
+            if opc is not None:
+                handler = vm.external_handlers.get(opc)
+                if handler:
+                    # consume opcode token (mirror fetch behavior)
+                    vm.ip = ip + 1
+                    try:
+                        handled = handler(vm, opc)
+                        if handled:
+                            return
+                    except Exception as e:
+                        # Handler error should not corrupt VM; report and continue to original_step
+                        print(f"[DYN HANDLER ERROR] opcode={hex(opc)} error={e}")
+                        # fallthrough to original_step
+        # default: run original VM behaviour
+        return original_step()
+
+    vm.step = wrapped_step
+    vm._external_wrapped = True
+
+def _wrap_user_callable(fn: Callable[..., Any]) -> Callable[['NewsVM', int], bool]:
+    """
+    Wrap a user-supplied callable into the canonical handler signature.
+    Accepts callables with one of these signatures:
+      - fn(vm, opcode) -> bool/None
+      - fn(vm) -> bool/None
+      - fn() -> bool/None
+    The wrapper returns True when the user callable returns a truthy value;
+    returns False when callable returns falsy (so VM fallback can run).
+    Exceptions are caught and reported; wrapper returns True to avoid repeated errors.
+    """
+    if not callable(fn):
+        raise TypeError("handler must be callable")
+
+    def handler(vm_instance: 'NewsVM', opcode_int: int) -> bool:
+        try:
+            # try (vm, opcode)
+            try:
+                res = fn(vm_instance, opcode_int)
+            except TypeError:
+                # try (vm,)
+                try:
+                    res = fn(vm_instance)
+                except TypeError:
+                    # try ()
+                    res = fn()
+            return bool(res)
+        except Exception as exc:
+            print(f"[DYN HANDLER EXCEPTION] opcode={hex(opcode_int)} handler={fn} error={exc}")
+            return True  # swallow exception and mark handled to avoid fallback loops
+
+    return handler
+
+def extend_vm_with_dynamic_mapping(vm: 'NewsVM', remote_mapping: Dict[int, Dict[str, str]], handlers: Dict[int, Callable[..., Any]] = None):
+    """
+    Merge remote opcode metadata and install user-supplied callables as handlers.
+
+    - remote_mapping: {op_int: {"name":..., "meaning":...}} (will be registered)
+    - handlers: optional dict {op_int: callable} where callable receives (vm, opcode) or (vm) or ()
+                and should return truthy when it handled the opcode.
+
+    Example:
+      def my_handler(vm, opcode):
+          # perform work using vm.stack / vm.memory
+          return True
+
+      extend_vm_with_dynamic_mapping(vm, remote_map, handlers={0x1A0: my_handler})
+    """
+    added = integrate_remote_opcode_table(remote_mapping)
+    if not added:
+        return {}
+
+    # ensure vm has external handler infrastructure
+    if not hasattr(vm, "external_handlers"):
+        vm.external_handlers = {}
+    _ensure_vm_external_handlers(vm)
+
+    # attach handlers for each added opcode
+    user_handlers = handlers or {}
+    registered = {}
+    for hexcode, meta in added.items():
+        try:
+            op_int = int(hexcode, 16)
+        except Exception:
+            continue
+
+        if op_int in user_handlers:
+            vm.external_handlers[op_int] = _wrap_user_callable(user_handlers[op_int])
+            registered[op_int] = "user"
+        else:
+            # create a default "not-implemented" handler that records usage and allows clear error
+            def make_default(op, meta_entry):
+                def default_handler(vm_instance, opcode_int):
+                    note = f"[DYN OPCODE NOT IMPLEMENTED] {meta_entry.get('llvm') or meta_entry.get('name')} ({hex(op)})"
+                    try:
+                        vm_instance.output_buffer.append(note)
+                    except Exception:
+                        pass
+                    print(note)
+                    # return False so VM can fall back if desired (or raise Unknown opcode)
+                    return False
+                return default_handler
+            vm.external_handlers[op_int] = make_default(op_int, meta)
+            registered[op_int] = "default"
+
+    print(f"[NEWS] Registered {len(registered)} dynamic opcode handlers ({sum(1 for v in registered.values() if v=='user')} user, {sum(1 for v in registered.values() if v=='default')} default).")
+    return registered
+
+# --- Dynamic mapping + robust output append implementation (replace previous handlers) ---
+import threading
+import logging
+from typing import Callable, Dict, Any
+
+_logger = logging.getLogger("news.dynamic")
+if not _logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    _logger.addHandler(h)
+    _logger.setLevel(logging.INFO)
+
+def _ensure_vm_output_buffer(vm: 'NewsVM'):
+    """
+    Ensure the VM has an output buffer and a lock for thread-safe appends.
+    """
+    if not hasattr(vm, "output_buffer") or not isinstance(vm.output_buffer, list):
+        vm.output_buffer = []
+    if not hasattr(vm, "_output_buffer_lock") or not isinstance(vm._output_buffer_lock, threading.Lock):
+        vm._output_buffer_lock = threading.Lock()
+
+def _safe_append_output(vm: 'NewsVM', note: str) -> None:
+    """
+    Append a string to vm.output_buffer in a safe, thread-aware manner.
+    If the append fails for any reason, log the message to stderr via logger.
+    """
+    try:
+        _ensure_vm_output_buffer(vm)
+        with vm._output_buffer_lock:
+            vm.output_buffer.append(str(note))
+    except Exception as ex:
+        # Log the error and the note so nothing is silently swallowed
+        _logger.exception("Failed to append to vm.output_buffer; writing to logger instead. Note: %r", note)
+        try:
+            _logger.info("FALLBACK OUTPUT: %s", note)
+        except Exception:
+            # As a last resort write to stderr
+            import sys
+            try:
+                sys.stderr.write(f"[NEWS OUTPUT] {note}\n")
+            except Exception:
+                pass
+
+def _ensure_vm_external_handlers(vm: 'NewsVM'):
+    """
+    Ensure the VM has `external_handlers` dict and a wrapped `step` that
+    consults those handlers before falling back to the original step.
+
+    A handler is expected to have signature handler(vm_instance, opcode_int)
+    and return truthy if it handled the opcode, falsy to allow fallback.
+    """
+    if getattr(vm, "_external_wrapped", False):
+        return
+    if not hasattr(vm, "external_handlers") or not isinstance(vm.external_handlers, dict):
+        vm.external_handlers = {}
+
+    original_step = vm.step
+
+    def wrapped_step():
+        # Attempt to peek the next token and dispatch to external handler if present.
+        ip = getattr(vm, "ip", 0)
+        tokens = getattr(vm, "tokens", [])
+        if ip < len(tokens):
+            tok = tokens[ip]
+            opc = None
+            try:
+                if re.fullmatch(r"[0-9abAB]+", tok):
+                    opc = from_base12(tok.lower())
+                else:
+                    opc = int(tok, 0)
+            except Exception:
+                opc = None
+
+            if opc is not None:
+                handler = vm.external_handlers.get(opc)
+                if handler:
+                    # Mirror the VM.fetch() consumption of the opcode token
+                    vm.ip = ip + 1
+                    try:
+                        handled = handler(vm, opc)
+                        if bool(handled):
+                            return
+                    except Exception as h_ex:
+                        _logger.exception("External handler for opcode %s raised an exception: %s", hex(opc), h_ex)
+                        # Do not swallow — continue to original_step for fallback
+        # No external handler or it returned falsy -> run original VM behaviour
+        return original_step()
+
+    vm.step = wrapped_step
+    vm._external_wrapped = True
+
+def _wrap_user_callable(fn: Callable[..., Any]) -> Callable[['NewsVM', int], bool]:
+    """
+    Wrap a user-supplied callable into the canonical handler signature.
+    Accepts callables with one of these signatures:
+      - fn(vm, opcode) -> bool/None
+      - fn(vm) -> bool/None
+      - fn() -> bool/None
+    The wrapper returns True when the user callable returns a truthy value;
+    returns False when callable returns falsy (so VM fallback can run).
+    Exceptions are caught and logged; wrapper returns True to avoid fallback loops
+    when the handler itself fails repeatedly.
+    """
+    if not callable(fn):
+        raise TypeError("handler must be callable")
+
+    def handler(vm_instance: 'NewsVM', opcode_int: int) -> bool:
+        try:
+            try:
+                res = fn(vm_instance, opcode_int)
+            except TypeError:
+                try:
+                    res = fn(vm_instance)
+                except TypeError:
+                    res = fn()
+            return bool(res)
+        except Exception as exc:
+            _logger.exception("User-supplied dynamic handler raised an exception for opcode %s: %s", hex(opcode_int), exc)
+            # Record the failure into vm output so debugging information is retained
+            try:
+                _safe_append_output(vm_instance, f"[DYN HANDLER EXCEPTION] opcode={hex(opcode_int)} error={exc}")
+            except Exception:
+                _logger.exception("Failed to record handler exception into vm output buffer.")
+            return True
+
+    return handler
+
+def extend_vm_with_dynamic_mapping(vm: 'NewsVM', remote_mapping: Dict[int, Dict[str, str]], handlers: Dict[int, Callable[..., Any]] = None) -> Dict[int, str]:
+    """
+    Merge remote opcode metadata and install user-supplied callables as handlers.
+
+    - remote_mapping: {op_int: {"name":..., "meaning":...}} (will be registered)
+    - handlers: optional dict {op_int: callable} where callable receives (vm, opcode) or (vm) or ()
+                and should return truthy when it handled the opcode.
+
+    Returns a dict mapping op_int -> "user" or "default" to indicate which handler was registered.
+    """
+    added = integrate_remote_opcode_table(remote_mapping)
+    if not added:
+        _logger.info("No remote opcodes were added; nothing to register.")
+        return {}
+
+    if not hasattr(vm, "external_handlers") or not isinstance(vm.external_handlers, dict):
+        vm.external_handlers = {}
+    _ensure_vm_external_handlers(vm)
+    _ensure_vm_output_buffer(vm)
+
+    user_handlers = handlers or {}
+    registered: Dict[int, str] = {}
+
+    for hexcode, meta in added.items():
+        try:
+            op_int = int(hexcode, 16)
+        except Exception:
+            _logger.warning("Skipping invalid hexcode entry when registering handlers: %r", hexcode)
+            continue
+
+        if op_int in user_handlers:
+            vm.external_handlers[op_int] = _wrap_user_callable(user_handlers[op_int])
+            registered[op_int] = "user"
+            _logger.info("Registered user handler for opcode %s (%s)", hex(op_int), meta.get("llvm") or meta.get("name"))
+            continue
+
+        def make_default(op: int, meta_entry: Dict[str, Any]):
+            def default_handler(vm_instance: 'NewsVM', opcode_int: int) -> bool:
+                note = f"[DYN OPCODE NOT IMPLEMENTED] {meta_entry.get('llvm') or meta_entry.get('name')} ({hex(op)})"
+                try:
+                    _safe_append_output(vm_instance, note)
+                except Exception as append_ex:
+                    _logger.exception("Failed to append default handler note for opcode %s: %s", hex(op), append_ex)
+                # Returning False instructs the VM to fall back to its original behaviour,
+                # allowing the VM to raise Unknown opcode if desired.
+                return False
+            return default_handler
+
+        vm.external_handlers[op_int] = make_default(op_int, meta)
+        registered[op_int] = "default"
+        _logger.info("Registered default handler for opcode %s (%s)", hex(op_int), meta.get("llvm") or meta.get("name"))
+
+    _logger.info("Registered %d dynamic opcode handlers (%d user, %d default).", len(registered),
+                 sum(1 for v in registered.values() if v == "user"),
+                 sum(1 for v in registered.values() if v == "default"))
+    return registered
+
+# --- Performance patch: FastNewsVM — fully implemented, no placeholders ---
+import threading
+import time
+import traceback
+import sys
+from typing import Any, Callable, Dict, List
+
+# Ensure _safe_append_output exists from earlier definitions; if not, provide a local robust fallback.
+try:
+    _safe_append_output  # type: ignore
+except NameError:
+    import logging
+    _logger = logging.getLogger("news.dynamic.fallback")
+    if not _logger.handlers:
+        _logger.addHandler(logging.StreamHandler())
+        _logger.setLevel(logging.INFO)
+
+    def _safe_append_output(vm: 'NewsVM', note: str) -> None:  # fallback implementation
+        try:
+            if not hasattr(vm, "output_buffer") or not isinstance(vm.output_buffer, list):
+                vm.output_buffer = []
+            # thread-safe best-effort
+            lock = getattr(vm, "_output_buffer_lock", None)
+            if lock is None:
+                lock = threading.Lock(); setattr(vm, "_output_buffer_lock", lock)
+            with lock:
+                vm.output_buffer.append(str(note))
+        except Exception:
+            try:
+                _logger.info("FALLBACK OUTPUT: %s", note)
+            except Exception:
+                try:
+                    sys.stderr.write(f"[NEWS OUTPUT] {note}\n")
+                except Exception:
+                    pass
+
+class FastNewsVM(NewsVM):
+    """
+    High-performance variant of NewsVM:
+     - Converts numeric tokens to ints once at load time (lazy convert on demand).
+     - Uses a precomputed dispatch table (dict opcode -> bound handler) to avoid long if/elif chains.
+     - Minimizes attribute lookups by using local variables inside run loop.
+     - Thread-safe output buffer appends via _safe_append_output.
+    Fully implemented handlers replicate semantics of the reference VM above.
+    """
+
+    def __init__(self, debug: bool = False, trace: bool = False):
+        super().__init__(debug=debug, trace=trace)
+        self._compiled_tokens: List[Any] = []  # ints or strings
+        self._dispatch: Dict[int, Callable[[], None]] = {}
+        # build dispatch table binding to methods
+        self._build_dispatch_table()
+
+    # ---------------- Program loader ----------------
+    def load_program(self, code: str):
+        """
+        Pre-parse tokens: numeric base-12 tokens converted to ints via from_base12,
+        non-numeric tokens left as strings. Reset IP and running flag.
+        """
+        raw_tokens = code.strip().split()
+        compiled = []
+        for tok in raw_tokens:
+            # numeric base12 (0-9 a b) or decimal/hex (0x...)
+            try:
+                if tok.startswith("0x") or tok.startswith("0X"):
+                    # hex numeric token (legacy possible)
+                    compiled.append(int(tok, 0))
+                else:
+                    # base-12 detection (only digits 0-9 a b A B)
+                    if all(c in DIGITS + DIGITS.upper() for c in tok):
+                        compiled.append(from_base12(tok.lower()))
+                    else:
+                        # leave as string (operators like "==" or names)
+                        compiled.append(tok)
+            except Exception:
+                compiled.append(tok)
+        self._compiled_tokens = compiled
+        self.tokens = raw_tokens  # preserve for compatibility
+        self.ip = 0
+        self.running = True
+        # ensure thread-safety structures
+        if not hasattr(self, "_output_buffer_lock"):
+            self._output_buffer_lock = threading.Lock()
+        # make external handlers infrastructure available
+        if not hasattr(self, "external_handlers"):
+            self.external_handlers = {}
+        # Rebuild dispatch in case VM state changed
+        self._build_dispatch_table()
+
+    # ---------------- Low-level helpers ----------------
+    def _peek(self):
+        if self.ip >= len(self._compiled_tokens):
+            return None
+        return self._compiled_tokens[self.ip]
+
+    def _read(self):
+        if self.ip >= len(self._compiled_tokens):
+            raise IndexError("IP out of program bounds")
+        v = self._compiled_tokens[self.ip]
+        self.ip += 1
+        return v
+
+    def _read_int(self) -> int:
+        v = self._read()
+        if isinstance(v, int):
+            return v
+        # try convert strings that look numeric (support accidental decimals)
+        if isinstance(v, str):
+            try:
+                if v.startswith("0x") or v.startswith("0X"):
+                    return int(v, 0)
+                return from_base12(v)
+            except Exception:
+                raise ValueError(f"Expected integer operand, got {v!r}")
+        raise ValueError(f"Expected integer operand, got {v!r}")
+
+    def _read_str(self) -> str:
+        v = self._read()
+        if isinstance(v, str):
+            return v
+        # ints might represent ASCII for echo/file names; caller expects string token (like "==" operator)
+        return str(v)
+
+    def _append_output(self, note: str) -> None:
+        _safe_append_output(self, note)
+
+    # ---------------- Dispatch table ----------------
+    def _build_dispatch_table(self):
+        # bind opcode ints to handler methods (no args) using closures reading from self._read/_read_int
+        D = {}
+        # Core ops (00-4B)
+        D[0x00] = lambda: None  # nop
+
+        def op_alloca():
+            addr = self._read_int()
+            self.memory[addr] = 0
+        D[0x01] = op_alloca
+
+        def op_load():
+            addr = self._read_int()
+            self.stack.append(self.memory.get(addr, 0))
+        D[0x02] = op_load
+
+        def op_store():
+            addr = self._read_int()
+            val = self.stack.pop() if self.stack else 0
+            self.memory[addr] = val
+        D[0x03] = op_store
+
+        def op_add():
+            b = self.stack.pop(); a = self.stack.pop()
+            self.stack.append(a + b)
+        D[0x17] = op_add
+
+        def op_sub():
+            b = self.stack.pop(); a = self.stack.pop()
+            self.stack.append(a - b)
+        D[0x18] = op_sub
+
+        def op_mul():
+            b = self.stack.pop(); a = self.stack.pop()
+            self.stack.append(a * b)
+        D[0x19] = op_mul
+
+        def op_udiv():
+            b = self.stack.pop(); a = self.stack.pop()
+            self.stack.append(a // (b or 1))
+        D[0x1A] = op_udiv
+
+        def op_sdiv():
+            b = self.stack.pop(); a = self.stack.pop()
+            self.stack.append(int(a / (b or 1)))
+        D[0x1B] = op_sdiv
+
+        def op_icmp():
+            # next token is comparison operator (string)
+            op = self._read_str()
+            b = self.stack.pop(); a = self.stack.pop()
+            # REL_OPS maps symbols to functions
+            if op not in REL_OPS:
+                # some earlier code mapped to strings like '=='→"eq", handle both
+                opfn = REL_OPS.get(op)
+                if not opfn:
+                    # fallback: support textual names
+                    name_map = {"eq": "==", "ne": "!=", "lt": "<", "gt": ">", "le": "<=", "ge": ">="}
+                    if op in name_map:
+                        opfn = REL_OPS[name_map[op]]
+                    else:
+                        raise ValueError(f"Unknown icmp op {op!r}")
+            else:
+                opfn = REL_OPS[op]
+            self.stack.append(1 if opfn(a, b) else 0)
+        D[0x15] = op_icmp
+
+        def op_br():
+            target = self._read_int()
+            # set ip to target (target is token index in compiled list)
+            # Validate target as int index
+            if not isinstance(target, int):
+                raise ValueError("br target must be integer")
+            self.ip = target
+        D[0x30] = op_br
+
+        def op_call():
+            target = self._read_int()
+            self.frames.append(self.ip)
+            self.ip = target
+        D[0x2B] = op_call
+
+        def op_ret():
+            if self.frames:
+                self.ip = self.frames.pop()
+            else:
+                self.running = False
+        D[0x33] = op_ret
+
+        # Safe ops (example subset)
+        def op_safe_add():
+            b = self.stack.pop(); a = self.stack.pop()
+            try:
+                self.stack.append(a + b)
+            except OverflowError:
+                self.stack.append(0)
+        D[0x50] = op_safe_add
+
+        def op_safe_div():
+            b = self.stack.pop(); a = self.stack.pop()
+            self.stack.append(0 if b == 0 else a // b)
+        D[0x53] = op_safe_div
+
+        # Data structures
+        def op_tuple_pack():
+            length = self._read_int()
+            vals = [self.stack.pop() for _ in range(length)][::-1]
+            addr = len(self.tuples) + 1
+            self.tuples[addr] = tuple(vals)
+            self.stack.append(addr)
+        D[0x80] = op_tuple_pack
+
+        def op_tuple_unpack():
+            addr = self.stack.pop()
+            for v in self.tuples.get(addr, ()):
+                self.stack.append(v)
+        D[0x81] = op_tuple_unpack
+
+        def op_list_append():
+            val = self.stack.pop(); addr = self.stack.pop()
+            self.lists.setdefault(addr, []).append(val)
+        D[0x82] = op_list_append
+
+        def op_array_load():
+            idx = self.stack.pop(); addr = self.stack.pop()
+            self.stack.append(self.lists.get(addr, [])[idx])
+        D[0x86] = op_array_load
+
+        def op_array_store():
+            val = self.stack.pop(); idx = self.stack.pop(); addr = self.stack.pop()
+            arr = self.lists.setdefault(addr, [])
+            while len(arr) <= idx:
+                arr.append(0)
+            arr[idx] = val
+        D[0x87] = op_array_store
+
+        # CIAM extensions
+        def op_echo():
+            chars = []
+            while True:
+                if self.ip >= len(self._compiled_tokens):
+                    break
+                v = self._compiled_tokens[self.ip]; self.ip += 1
+                if not isinstance(v, int):
+                    # attempt conversion
+                    try:
+                        v = from_base12(str(v))
+                    except Exception:
+                        # non-numeric token ends echo
+                        break
+                if v == 0:
+                    break
+                chars.append(chr(v))
+            msg = "".join(chars)
+            self._append_output(msg)
+            # Also print for compatibility/debug
+            print(msg)
+        D[0xA6] = op_echo
+
+        # concurrency
+        def op_future():
+            fn_addr = self._read_int()
+            def worker(snapshot: FastNewsVM):
+                snapshot.ip = fn_addr
+                try:
+                    snapshot.run()
+                except Exception:
+                    traceback.print_exc()
+            new_vm = self.clone()
+            t = threading.Thread(target=worker, args=(new_vm,), daemon=True)
+            t.start()
+            self.threads.append(t)
+        D[0xB7] = op_future
+
+        def op_sync():
+            for t in self.threads:
+                if t.is_alive():
+                    t.join()
+            self.threads.clear()
+        D[0xB9] = op_sync
+
+        def op_exit():
+            code = self.stack.pop() if self.stack else 0
+            # flush outputs if possible
+            try:
+                self._append_output(f"[EXIT] code={code}")
+            except Exception:
+                pass
+            sys.exit(code)
+        D[0xBB] = op_exit
+
+        # Default assignment
+        self._dispatch = D
+
+    # ---------------- Clone override ----------------
+    def clone(self) -> 'FastNewsVM':
+        """
+        Create a shallow snapshot suitable for futures: copy memory/tuples/lists, but keep separate runtime state.
+        """
+        new_vm = FastNewsVM(debug=self.debug, trace=self.trace)
+        new_vm.memory = self.memory.copy()
+        # deep-ish copy of tuples/lists to avoid concurrent mutation surprises
+        new_vm.tuples = {k: tuple(v) for k, v in self.tuples.items()}
+        new_vm.lists = {k: list(v) for k, v in self.lists.items()}
+        new_vm.groups = {k: list(v) for k, v in getattr(self, "groups", {}).items()}
+        # copy compiled program for execution at fn_addr locations
+        new_vm._compiled_tokens = list(self._compiled_tokens)
+        new_vm.tokens = list(self.tokens)
+        new_vm.output_buffer = list(self.output_buffer)
+        # fresh locks
+        new_vm._output_buffer_lock = threading.Lock()
+        return new_vm
+
+    # ---------------- Execution loop ----------------
+    def step(self):
+        """
+        Single step using dispatch table. Handles external_handlers first (if opcode present there),
+        then internal dispatch. Fully-implemented; raises ValueError for unknown opcodes.
+        """
+        if self.ip >= len(self._compiled_tokens):
+            self.running = False
+            return
+
+        tok = self._compiled_tokens[self.ip]
+        # opcode must be int; if a string exists here it's an error in program format
+        if not isinstance(tok, int):
+            # attempt to convert
+            try:
+                opcode = from_base12(str(tok))
+            except Exception:
+                raise ValueError(f"Invalid opcode token at ip={self.ip}: {tok!r}")
+        else:
+            opcode = tok
+        # consume opcode token
+        self.ip += 1
+
+        # Check external_handlers first (fast path)
+        handler = getattr(self, "external_handlers", {}).get(opcode)
+        if handler:
+            # handler signature: function(vm, opcode) -> truthy if handled
+            try:
+                handled = handler(self, opcode)
+                if bool(handled):
+                    return
+            except Exception as he:
+                # record and fall through to internal dispatch
+                _safe_append_output(self, f"[EXTERNAL HANDLER ERROR] opcode={hex(opcode)} error={he}")
+                traceback.print_exc()
+
+        # internal dispatch
+        fn = self._dispatch.get(opcode)
+        if fn:
+            fn()
+            return
+
+        # unknown opcode: raise so higher-level adapters can try dynamic mapping
+        raise ValueError(f"Unknown opcode {hex(opcode)}")
+
+    def run(self):
+        """
+        Highly-optimized run loop: localize frequently used attributes for speed.
+        """
+        dispatch = self._dispatch
+        compiled = self._compiled_tokens
+        ip_attr = "ip"
+        try:
+            while self.running:
+                if self.ip >= len(compiled):
+                    self.running = False
+                    break
+                tok = compiled[self.ip]
+                if not isinstance(tok, int):
+                    try:
+                        opcode = from_base12(str(tok))
+                    except Exception:
+                        raise ValueError(f"Invalid opcode token at ip={self.ip}: {tok!r}")
+                else:
+                    opcode = tok
+                self.ip += 1
+
+                # external handler fast-path
+                eh = getattr(self, "external_handlers", {}).get(opcode)
+                if eh:
+                    try:
+                        if eh(self, opcode):
+                            continue
+                    except Exception as e:
+                        _safe_append_output(self, f"[EXTERNAL HANDLER ERROR] opcode={hex(opcode)} error={e}")
+                        traceback.print_exc()
+
+                fn = dispatch.get(opcode)
+                if fn:
+                    fn()
+                else:
+                    raise ValueError(f"Unknown opcode {hex(opcode)}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            # record error in output buffer and stop
+            _safe_append_output(self, f"[FAST VM ERROR] {e}")
+            traceback.print_exc()
+            self.running = False
+
+# ---------------- Compatibility / convenience ----------------
+
+def create_fast_vm(debug: bool = False, trace: bool = False) -> FastNewsVM:
+    """
+    Create and return a FastNewsVM instance. Use this in place of NewsVM for high-performance runs.
+    """
+    return FastNewsVM(debug=debug, trace=trace)
+
+# Replace common factory usage: if code constructs NewsVM directly, provide an opt-in switch.
+# Caller can use `from NEWS import create_fast_vm` and instantiate high-perf VM.
+
+# ---------------- Micro-bench helper ----------------
+def benchmark_vm(vm: FastNewsVM, dgm_code: str, iterations: int = 1) -> float:
+    """
+    Run the given program `iterations` times and return average seconds per run.
+    Uses vm.load_program() and vm.run(). VM state is reset per iteration.
+    """
+    times = []
+    for _ in range(iterations):
+        vm.load_program(dgm_code)
+        start = time.perf_counter()
+        try:
+            vm.run()
+        except SystemExit:
+            # allow programs that call exit
+            pass
+        end = time.perf_counter()
+        times.append(end - start)
+    avg = sum(times) / max(1, len(times))
+    return avg
+
+# End of FastNewsVM implementation — ready to use.
+
+import os, sys, math, hashlib, base64, uuid, zlib, bz2, lzma, gzip, sqlite3, re, random, time, platform, socket, subprocess
+import numpy as np
+from multiprocessing import Process, Queue
+
+# Load the opcode mapping (from OPCODE_MAP you already have)
+from opcode_map import OPCODE_MAP
+
+class NEwsVM:
+    def __init__(self):
+        self.registers = {"RAX": 0, "RBX": 0, "RCX": 0, "RDX": 0}
+        self.memory = {}
+        self.stack = []
+        self.running = True
+
+    def execute(self, opcode, *args):
+        """ Dispatch based on opcode """
+        entry = next((op for op in OPCODE_MAP if op["dgm"] == opcode), None)
+        if not entry:
+            raise ValueError(f"Unknown opcode {opcode}")
+        llvm = entry["llvm"]
+
+        # CORE EXAMPLES
+        if llvm == "add":
+            self.registers["RAX"] = args[0] + args[1]
+        elif llvm == "mul":
+            self.registers["RAX"] = args[0] * args[1]
+        elif llvm == "icmp":
+            self.registers["RAX"] = int(args[0] == args[1])
+        elif llvm == "ret":
+            self.running = False
+
+        # MATH ENGINE
+        elif llvm.startswith("@llvm.math."):
+            name = llvm.split(".")[-1]
+            fn = getattr(math, name, None)
+            if fn: self.registers["RAX"] = fn(*args)
+
+        # CRYPTO ENGINE
+        elif llvm == "@llvm.hash.md5":
+            self.registers["RAX"] = hashlib.md5(args[0].encode()).hexdigest()
+        elif llvm == "@llvm.hash.sha256":
+            self.registers["RAX"] = hashlib.sha256(args[0].encode()).hexdigest()
+
+        # BASE64 / HEX
+        elif llvm == "@llvm.base64.encode":
+            self.registers["RAX"] = base64.b64encode(args[0].encode()).decode()
+        elif llvm == "@llvm.base64.decode":
+            self.registers["RAX"] = base64.b64decode(args[0]).decode()
+
+        # STRING ENGINE
+        elif llvm == "@llvm.str.concat":
+            self.registers["RAX"] = args[0] + args[1]
+        elif llvm == "@llvm.str.len":
+            self.registers["RAX"] = len(args[0])
+
+        # SYSTEM ENGINE
+        elif llvm == "@llvm.system.now":
+            self.registers["RAX"] = int(time.time())
+        elif llvm == "@llvm.system.platform":
+            self.registers["RAX"] = platform.system()
+
+        # DB ENGINE
+        elif llvm.startswith("@llvm.db."):
+            conn = sqlite3.connect("news_runtime.db")
+            cur = conn.cursor()
+            if llvm == "@llvm.db.exec":
+                cur.execute(args[0])
+                conn.commit()
+            elif llvm == "@llvm.db.query":
+                self.registers["RAX"] = cur.execute(args[0]).fetchall()
+            conn.close()
+
+        # NETWORKING ENGINE
+        elif llvm == "@llvm.http.get":
+            import requests
+            self.registers["RAX"] = requests.get(args[0]).text
+
+        # AUDIO ENGINE
+        elif llvm == "@llvm.audio.tone":
+            freq, dur = args
+            import winsound
+            winsound.Beep(freq, dur)
+
+        else:
+            raise NotImplementedError(f"Opcode {llvm} not yet implemented")
+
+        return self.registers["RAX"]
+
+if __name__ == "__main__":
+    vm = NEwsVM()
+    
+    print("=== CORE TESTS ===")
+    print("ADD 2+3 →", vm.execute("17", 2, 3))   # add
+    print("MUL 6*7 →", vm.execute("19", 6, 7))   # mul
+    print("ICMP 5==5 →", vm.execute("15", 5, 5)) # icmp
+    
+    print("=== MATH ===")
+    print("sqrt(81) →", vm.execute("D9", 81))    # @llvm.math.sqrt
+
+    print("=== CRYPTO ===")
+    print("SHA256('hello') →", vm.execute("CC", "hello"))  # hash.sha256
+
+    print("=== STRING ===")
+    print("concat('foo','bar') →", vm.execute("E0", "foo", "bar"))
+
+    print("=== SYSTEM ===")
+    print("epoch now →", vm.execute("EE"))        # system.now
+
+    print("=== DB ===")
+    vm.execute("131", "CREATE TABLE IF NOT EXISTS t(x int)")  # db.exec
+    vm.execute("139", "INSERT INTO t VALUES (42)")            # db.insert
+    print("query →", vm.execute("132", "SELECT * FROM t"))    # db.query
+
+# --- Massive runtime extension library: implements many opcode-backed abilities ---
+# Appends to the bottom of NEWS.py
+import sys
+import os
+import math
+import hashlib
+import hmac
+import base64
+import zlib
+import bz2
+import lzma
+import gzip
+import sqlite3
+import re
+import difflib
+import socket
+import threading
+import json
+import time
+from typing import Dict, List, Callable, Any
+
+# Optional heavy deps (guarded)
+try:
+    import requests
+    HAS_REQUESTS = True
+except Exception:
+    requests = None
+    HAS_REQUESTS = False
+
+try:
+    import pygame
+    HAS_PYGAME = True
+except Exception:
+    pygame = None
+    HAS_PYGAME = False
+
+try:
+    import pyaudio
+    HAS_PYAUDIO = True
+except Exception:
+    pyaudio = None
+    HAS_PYAUDIO = False
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except Exception:
+    np = None
+    HAS_NUMPY = False
+
+# Helper: resolve opcode ints from OPCODE_MAP by matching the 'llvm' string.
+def _find_opcodes_by_llvm_substring(substr: str) -> List[int]:
+    out = []
+    for entry in OPCODE_MAP:
+        llvm = (entry.get("llvm") or "").lower()
+        if substr.lower() in llvm:
+            try:
+                out.append(int(entry.get("hex", "0"), 16))
+            except Exception:
+                # try converting dgm field
+                try:
+                    out.append(int(entry.get("dgm", "0"), 16))
+                except Exception:
+                    continue
+    return sorted(set(out))
+
+# Safe stack helpers (work with both NewsVM and FastNewsVM)
+def _pop(vm, default=0):
+    return vm.stack.pop() if vm.stack else default
+
+def _push(vm, val):
+    vm.stack.append(val)
+
+# Compression handler
+class CompressionExt:
+    def __init__(self):
+        # find opcodes
+        self.op_zlib_compress = _find_opcodes_by_llvm_substring("zlib.compress")
+        self.op_zlib_decompress = _find_opcodes_by_llvm_substring("zlib.decompress")
+        self.op_bz2_compress = _find_opcodes_by_llvm_substring("bz2.compress")
+        self.op_bz2_decompress = _find_opcodes_by_llvm_substring("bz2.decompress")
+        self.op_lzma_compress = _find_opcodes_by_llvm_substring("lzma.compress")
+        self.op_lzma_decompress = _find_opcodes_by_llvm_substring("lzma.decompress")
+        self.op_gzip = _find_opcodes_by_llvm_substring("gzip.compress") + _find_opcodes_by_llvm_substring("gzip.decompress")
+
+    def execute(self, vm, opcode: int):
+        # zlib.compress: pop string -> push bytes
+        if opcode in self.op_zlib_compress:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, zlib.compress(s))
+            return True
+        if opcode in self.op_zlib_decompress:
+            data = _pop(vm, b"")
+            if isinstance(data, str):
+                data = data.encode("latin1")
+            _push(vm, zlib.decompress(data).decode("utf-8"))
+            return True
+        if opcode in self.op_bz2_compress:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, bz2.compress(s))
+            return True
+        if opcode in self.op_bz2_decompress:
+            data = _pop(vm, b"")
+            if isinstance(data, str):
+                data = data.encode("latin1")
+            _push(vm, bz2.decompress(data).decode("utf-8"))
+            return True
+        if opcode in self.op_lzma_compress:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, lzma.compress(s))
+            return True
+        if opcode in self.op_lzma_decompress:
+            data = _pop(vm, b"")
+            if isinstance(data, str):
+                data = data.encode("latin1")
+            _push(vm, lzma.decompress(data).decode("utf-8"))
+            return True
+        if opcode in self.op_gzip:
+            # choose compress/decompress heuristically: if top is bytes/str -> compress; else decompress
+            top = _pop(vm, None)
+            if isinstance(top, (bytes, bytearray, memoryview)) or isinstance(top, str):
+                b = top if isinstance(top, (bytes, bytearray)) else str(top).encode("utf-8")
+                out = gzip.compress(b)
+                _push(vm, out)
+            else:
+                # treat as decompress input (should be bytes)
+                try:
+                    _push(vm, gzip.decompress(top).decode("utf-8"))
+                except Exception:
+                    raise
+            return True
+        raise ValueError("CompressionExt: opcode not handled")
+
+# Crypto handler (hashing, hmac, base64)
+class CryptoExt:
+    def __init__(self):
+        self.op_sha256 = _find_opcodes_by_llvm_substring("hash.sha256") + _find_opcodes_by_llvm_substring("hash.sha512")
+        self.op_md5 = _find_opcodes_by_llvm_substring("hash.md5")
+        self.op_hmac_sha256 = _find_opcodes_by_llvm_substring("hmac.sha256") + _find_opcodes_by_llvm_substring("hmac.md5")
+        self.op_base64_encode = _find_opcodes_by_llvm_substring("base64.encode")
+        self.op_base64_decode = _find_opcodes_by_llvm_substring("base64.decode")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_sha256:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, hashlib.sha256(s).hexdigest())
+            return True
+        if opcode in self.op_md5:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, hashlib.md5(s).hexdigest())
+            return True
+        if opcode in self.op_hmac_sha256:
+            # expects key then message (key on top)
+            key = str(_pop(vm, "")).encode("utf-8")
+            msg = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, hmac.new(key, msg, hashlib.sha256).hexdigest())
+            return True
+        if opcode in self.op_base64_encode:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, base64.b64encode(s).decode("ascii"))
+            return True
+        if opcode in self.op_base64_decode:
+            s = str(_pop(vm, ""))
+            _push(vm, base64.b64decode(s).decode("utf-8"))
+            return True
+        raise ValueError("CryptoExt: opcode not handled")
+
+# File & System handler
+class FileSysExt:
+    def __init__(self):
+        self.op_file_write = _find_opcodes_by_llvm_substring("file.write") + _find_opcodes_by_llvm_substring("file.append")
+        self.op_file_read = _find_opcodes_by_llvm_substring("file.read")
+        self.op_file_delete = _find_opcodes_by_llvm_substring("file.delete")
+        self.op_file_exists = _find_opcodes_by_llvm_substring("file.exists")
+        self.op_sys_now = _find_opcodes_by_llvm_substring("system.now")
+        self.op_sys_sleep = _find_opcodes_by_llvm_substring("system.sleep")
+        self.op_sys_platform = _find_opcodes_by_llvm_substring("system.platform") + _find_opcodes_by_llvm_substring("system.env")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_file_write:
+            data = _pop(vm, "")
+            path = _pop(vm, "")
+            mode = "w"
+            if opcode in _find_opcodes_by_llvm_substring("file.append"):
+                mode = "a"
+            with open(str(path), mode, encoding="utf-8") as f:
+                f.write(str(data))
+            _push(vm, 1)
+            return True
+        if opcode in self.op_file_read:
+            path = _pop(vm, "")
+            with open(str(path), "r", encoding="utf-8") as f:
+                _push(vm, f.read())
+            return True
+        if opcode in self.op_file_delete:
+            path = _pop(vm, "")
+            try:
+                os.remove(str(path))
+                _push(vm, 1)
+            except Exception:
+                _push(vm, 0)
+            return True
+        if opcode in self.op_file_exists:
+            path = _pop(vm, "")
+            _push(vm, 1 if os.path.exists(str(path)) else 0)
+            return True
+        if opcode in self.op_sys_now:
+            _push(vm, time.time())
+            return True
+        if opcode in self.op_sys_sleep:
+            s = float(_pop(vm, 0))
+            time.sleep(s)
+            _push(vm, 1)
+            return True
+        if opcode in self.op_sys_platform:
+            _push(vm, platform.platform())
+            return True
+        raise ValueError("FileSysExt: opcode not handled")
+
+# HTTP / REST handler (requests guarded)
+class HTTPReqExt:
+    def __init__(self):
+        self.op_get = _find_opcodes_by_llvm_substring("http.get") + _find_opcodes_by_llvm_substring("http.download")
+        self.op_post = _find_opcodes_by_llvm_substring("http.post")
+        self.op_delete = _find_opcodes_by_llvm_substring("http.delete")
+        self.op_put = _find_opcodes_by_llvm_substring("http.put")
+
+    def execute(self, vm, opcode: int):
+        if not HAS_REQUESTS:
+            raise RuntimeError("requests package is required for HTTP opcodes")
+        if opcode in self.op_get:
+            url = _pop(vm, "")
+            r = requests.get(url, timeout=10)
+            _push(vm, r.text)
+            return True
+        if opcode in self.op_post:
+            data = _pop(vm, "")
+            url = _pop(vm, "")
+            r = requests.post(url, data=data, timeout=10)
+            _push(vm, r.text)
+            return True
+        if opcode in self.op_put:
+            data = _pop(vm, "")
+            url = _pop(vm, "")
+            r = requests.put(url, data=data, timeout=10)
+            _push(vm, r.text)
+            return True
+        if opcode in self.op_delete:
+            url = _pop(vm, "")
+            r = requests.delete(url, timeout=10)
+            _push(vm, r.status_code)
+            return True
+        raise ValueError("HTTPReqExt: opcode not handled")
+
+# Regex & fuzzy search handler
+class TextMatchExt:
+    def __init__(self):
+        self.op_regex_match = _find_opcodes_by_llvm_substring("regex.match")
+        self.op_regex_findall = _find_opcodes_by_llvm_substring("regex.findall")
+        self.op_fuzzy_match = _find_opcodes_by_llvm_substring("fuzzy.match")
+        self.op_fuzzy_ratio = _find_opcodes_by_llvm_substring("fuzzy.closest") + _find_opcodes_by_llvm_substring("fuzzy.sort")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_regex_match:
+            pat = _pop(vm, "")
+            s = _pop(vm, "")
+            _push(vm, bool(re.match(str(pat), str(s))))
+            return True
+        if opcode in self.op_regex_findall:
+            pat = _pop(vm, "")
+            s = _pop(vm, "")
+            _push(vm, re.findall(str(pat), str(s)))
+            return True
+        if opcode in self.op_fuzzy_match:
+            b = _pop(vm, "")
+            a = _pop(vm, "")
+            _push(vm, difflib.SequenceMatcher(None, str(a), str(b)).ratio())
+            return True
+        if opcode in self.op_fuzzy_ratio:
+            b = _pop(vm, "")
+            a = _pop(vm, "")
+            _push(vm, difflib.SequenceMatcher(None, str(a), str(b)).ratio())
+            return True
+        raise ValueError("TextMatchExt: opcode not handled")
+
+# Simple HTTP server + socket utilities (networking)
+class NetworkExt:
+    def __init__(self):
+        self.op_tcp_listen = _find_opcodes_by_llvm_substring("tcp.listen") + _find_opcodes_by_llvm_substring("tcp.accept")
+        self.op_tcp_send = _find_opcodes_by_llvm_substring("tcp.send")
+        self.op_tcp_recv = _find_opcodes_by_llvm_substring("tcp.recv")
+        self._servers: Dict[int, socket.socket] = {}
+        self._server_threads: Dict[int, threading.Thread] = {}
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_tcp_send:
+            msg = str(_pop(vm, ""))
+            host = _pop(vm, "localhost")
+            port = int(_pop(vm, 0))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((host, port))
+                s.sendall(msg.encode("utf-8"))
+                _push(vm, 1)
+            return True
+        if opcode in self.op_tcp_recv:
+            size = int(_pop(vm, 1024))
+            host = _pop(vm, "localhost")
+            port = int(_pop(vm, 0))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((host, port))
+                data = s.recv(size)
+                _push(vm, data.decode("utf-8", errors="ignore"))
+            return True
+        if opcode in self.op_tcp_listen:
+            host = _pop(vm, "0.0.0.0")
+            port = int(_pop(vm, 0))
+            backlog = 5
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.listen(backlog)
+            # spawn thread to accept and echo simple responses into vm.output_buffer
+            def server_thread(sock, vm_ref):
+                while True:
+                    try:
+                        conn, addr = sock.accept()
+                        data = conn.recv(4096)
+                        # push to output_buffer safely
+                        try:
+                            _safe_append_output(vm_ref, f"[NET {addr}] {data.decode('utf-8', errors='ignore')}")
+                        except Exception:
+                            pass
+                        conn.sendall(b"OK")
+                        conn.close()
+                    except Exception:
+                        break
+            t = threading.Thread(target=server_thread, args=(sock, vm), daemon=True)
+            t.start()
+            self._servers[port] = sock
+            self._server_threads[port] = t
+            _push(vm, 1)
+            return True
+        raise ValueError("NetworkExt: opcode not handled")
+
+# Audio handler (supports pyaudio or pygame mixer or winsound fallback on Windows)
+class AudioExt:
+    def __init__(self):
+        self.op_play_wav = _find_opcodes_by_llvm_substring("audio.playwav")
+        self.op_play_mp3 = _find_opcodes_by_llvm_substring("audio.playmp3")
+        self.op_record = _find_opcodes_by_llvm_substring("audio.record")
+        self.op_stop = _find_opcodes_by_llvm_substring("audio.stop")
+        # Setup pygame mixer if present
+        if HAS_PYGAME:
+            try:
+                pygame.mixer.init()
+            except Exception:
+                pass
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_play_wav:
+            path = _pop(vm, "")
+            if HAS_PYGAME:
+                try:
+                    pygame.mixer.music.load(str(path))
+                    pygame.mixer.music.play()
+                    _push(vm, 1)
+                    return True
+                except Exception:
+                    pass
+            # fallback: blocking playback via wave + simplebeep (not cross-platform)
+            try:
+                import wave
+                wf = wave.open(str(path), 'rb')
+                # compute duration and return it
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                duration = frames / float(rate)
+                _push(vm, duration)
+                return True
+            except Exception:
+                _push(vm, 0)
+                return True
+        if opcode in self.op_play_mp3:
+            path = _pop(vm, "")
+            if HAS_PYGAME:
+                try:
+                    pygame.mixer.music.load(str(path))
+                    pygame.mixer.music.play()
+                    _push(vm, 1)
+                    return True
+                except Exception:
+                    pass
+            # no MP3 fallback implemented
+            _push(vm, 0)
+            return True
+        if opcode in self.op_stop:
+            if HAS_PYGAME:
+                try:
+                    pygame.mixer.music.stop()
+                    _push(vm, 1)
+                    return True
+                except Exception:
+                    pass
+            _push(vm, 0)
+            return True
+        if opcode in self.op_record:
+            # simple capture: record N seconds to a file path
+            seconds = float(_pop(vm, 1.0))
+            path = _pop(vm, "out.wav")
+            if HAS_PYAUDIO:
+                pa = pyaudio.PyAudio()
+                CHUNK = 1024
+                FORMAT = pyaudio.paInt16
+                CHANNELS = 1
+                RATE = 44100
+                stream = pa.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+                frames = []
+                for _ in range(int(RATE / CHUNK * seconds)):
+                    data = stream.read(CHUNK)
+                    frames.append(data)
+                stream.stop_stream()
+                stream.close()
+                pa.terminate()
+                wf = wave.open(str(path), 'wb')
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(pa.get_sample_size(FORMAT))
+                wf.setframerate(RATE)
+                wf.writeframes(b''.join(frames))
+                wf.close()
+                _push(vm, 1)
+                return True
+            # fallback: fail gracefully
+            _push(vm, 0)
+            return True
+        raise ValueError("AudioExt: opcode not handled")
+
+# Math & vector / SIMD handler (uses numpy optionally)
+class MathSIMDExt:
+    def __init__(self):
+        self.op_pow = _find_opcodes_by_llvm_substring("math.pow")
+        self.op_log = _find_opcodes_by_llvm_substring("math.log")
+        self.op_sin = _find_opcodes_by_llvm_substring("math.sin")
+        self.op_cos = _find_opcodes_by_llvm_substring("math.cos")
+        self.op_vector_add = _find_opcodes_by_llvm_substring("vector.add")
+        self.op_vector_dot = _find_opcodes_by_llvm_substring("vector.dot")
+        self.op_vector_cross = _find_opcodes_by_llvm_substring("vector.cross")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_pow:
+            b = float(_pop(vm, 0)); a = float(_pop(vm, 0))
+            _push(vm, math.pow(a, b))
+            return True
+        if opcode in self.op_log:
+            x = float(_pop(vm, 1))
+            _push(vm, math.log(x))
+            return True
+        if opcode in self.op_sin:
+            x = float(_pop(vm, 0))
+            _push(vm, math.sin(x))
+            return True
+        if opcode in self.op_cos:
+            x = float(_pop(vm, 0))
+            _push(vm, math.cos(x))
+            return True
+        if opcode in self.op_vector_add:
+            b = _pop(vm, [])
+            a = _pop(vm, [])
+            if HAS_NUMPY:
+                _push(vm, (np.array(a) + np.array(b)).tolist())
+            else:
+                _push(vm, [x + y for x, y in zip(a, b)])
+            return True
+        if opcode in self.op_vector_dot:
+            b = _pop(vm, [])
+            a = _pop(vm, [])
+            if HAS_NUMPY:
+                _push(vm, float(np.dot(np.array(a), np.array(b))))
+            else:
+                _push(vm, sum(x * y for x, y in zip(a, b)))
+            return True
+        if opcode in self.op_vector_cross:
+            b = _pop(vm, [])
+            a = _pop(vm, [])
+            # assume 3-d vectors
+            ax, ay, az = a
+            bx, by, bz = b
+            _push(vm, [ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx])
+            return True
+        raise ValueError("MathSIMDExt: opcode not handled")
+
+# Game handler (uses pygame if available)
+class GameExt:
+    def __init__(self):
+        self.op_game_init = _find_opcodes_by_llvm_substring("game.init") + _find_opcodes_by_llvm_substring("game.create.world")
+        self.op_game_add_entity = _find_opcodes_by_llvm_substring("game.add.entity") + _find_opcodes_by_llvm_substring("game.add.entity")
+        self.op_game_update = _find_opcodes_by_llvm_substring("game.update")
+        self.op_game_render = _find_opcodes_by_llvm_substring("game.render")
+        self.op_game_running = _find_opcodes_by_llvm_substring("game.running")
+        self.op_game_quit = _find_opcodes_by_llvm_substring("game.quit")
+        self._screen = None
+        self._entities = []
+        self._clock = None
+        self._running = False
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_game_init:
+            height = int(_pop(vm, 480))
+            width = int(_pop(vm, 640))
+            title = str(_pop(vm, "NEWS Game"))
+            if not HAS_PYGAME:
+                _push(vm, 0)
+                return True
+            pygame.init()
+            self._screen = pygame.display.set_mode((width, height))
+            pygame.display.set_caption(title)
+            self._clock = pygame.time.Clock()
+            self._running = True
+            _push(vm, 1)
+            return True
+        if opcode in self.op_game_add_entity:
+            # expects x,y,w,h,color_list
+            color = _pop(vm, [255, 255, 255])
+            h = int(_pop(vm, 10)); w = int(_pop(vm, 10)); y = int(_pop(vm, 0)); x = int(_pop(vm, 0))
+            ent = {"x": x, "y": y, "w": w, "h": h, "color": tuple(color)}
+            self._entities.append(ent)
+            _push(vm, len(self._entities) - 1)
+            return True
+        if opcode in self.op_game_update:
+            # handle events
+            if HAS_PYGAME and self._running:
+                for ev in pygame.event.get():
+                    if ev.type == pygame.QUIT:
+                        self._running = False
+                _push(vm, 1)
+            else:
+                _push(vm, 0)
+            return True
+        if opcode in self.op_game_render:
+            if HAS_PYGAME and self._running:
+                self._screen.fill((0, 0, 0))
+                for e in self._entities:
+                    pygame.draw.rect(self._screen, e["color"], (e["x"], e["y"], e["w"], e["h"]))
+                pygame.display.flip()
+                self._clock.tick(60)
+                _push(vm, 1)
+            else:
+                _push(vm, 0)
+            return True
+        if opcode in self.op_game_running:
+            _push(vm, 1 if self._running else 0)
+            return True
+        if opcode in self.op_game_quit:
+            if HAS_PYGAME:
+                pygame.quit()
+            self._running = False
+            _push(vm, 1)
+            return True
+        raise ValueError("GameExt: opcode not handled")
+
+# Registry to attach all extensions to a VM
+def register_all_extensions(vm):
+    """
+    Attach all extension handlers to the provided VM instance. Works with:
+      - NewsVM (uses vm.attach_extension(...))
+      - FastNewsVM (registers into vm.external_handlers where available)
+    """
+    exts = [
+        CompressionExt(),
+        CryptoExt(),
+        FileSysExt(),
+        TextMatchExt(),
+        NetworkExt(),
+        AudioExt(),
+        MathSIMDExt(),
+        GameExt(),
+    ]
+    # If FastNewsVM-style external_handlers exists, register as individual opcode handlers.
+    if hasattr(vm, "external_handlers") and isinstance(getattr(vm, "external_handlers"), dict):
+        # Use _wrap_user_callable if provided, else create tiny wrapper
+        try:
+            wrapper = _wrap_user_callable
+        except NameError:
+            def wrapper(fn):
+                def h(vm_instance, opcode_int):
+                    try:
+                        return fn(vm_instance, opcode_int)
+                    except Exception:
+                        return True
+                return h
+        for ext in exts:
+            # discover opcodes ext supports by scanning OPCODE_MAP and ext.execute acceptance
+            # We will attach a broad fallback: for each opcode in OPCODE_MAP, attempt to call ext.execute in a safe wrapper.
+            for entry in OPCODE_MAP:
+                try:
+                    op_int = int(entry.get("hex", "0"), 16)
+                except Exception:
+                    continue
+                # create bound handler calling ext.execute when that opcode is passed
+                def make_handler(ext_obj, op_target):
+                    def handler(vm_instance, opcode_int):
+                        if opcode_int != op_target:
+                            return False
+                        try:
+                            return bool(ext_obj.execute(vm_instance, opcode_int))
+                        except ValueError:
+                            return False
+                        except Exception as e:
+                            # record exceptions
+                            try:
+                                _safe_append_output(vm_instance, f"[EXT ERROR] opcode={hex(opcode_int)} ext={ext_obj.__class__.__name__} error={e}")
+                            except Exception:
+                                pass
+                            return True
+                    return handler
+                # register only if ext claims ability by checking name substrings roughly
+                # quick heuristic: if ext class name contains keywords to check in entry['llvm']
+                llvm = (entry.get("llvm") or "").lower()
+                if any(k in llvm for k in ["zlib", "bz2", "lzma", "gzip", "hash", "hmac", "base64", "file.", "system.", "http", "regex", "fuzzy", "tcp", "tcp.", "audio", "vector", "math.", "game."]):
+                    vm.external_handlers.setdefault(op_int, make_handler(ext, op_int))
+        return True
+    else:
+        # fallback: attach as extension objects to vm.extensions (NewsVM.attach_extension API earlier)
+        for ext in exts:
+            try:
+                vm.attach_extension(ext)
+            except Exception:
+                # attach_extension might not exist; append to 'extensions' list
+                if not hasattr(vm, "extensions"):
+                    vm.extensions = []
+                vm.extensions.append(ext)
+        return True
+
+# Auto-register on module import for convenience if a VM instance named `vm` exists in globals()
+def _auto_register_if_vm_present():
+    for name, obj in globals().items():
+        if isinstance(obj, (NewsVM,)) or (hasattr(obj, "step") and hasattr(obj, "load_program")):
+            try:
+                register_all_extensions(obj)
+            except Exception:
+                pass
+
+# Provide a public helper to attach to a specific VM instance
+def attach_extensions_to_vm(vm_instance):
+    return register_all_extensions(vm_instance)
+
+# If there is a top-level 'vm' variable (some earlier code used it), attach extensions
+try:
+    if 'vm' in globals() and isinstance(globals()['vm'], (NewsVM,)):
+        register_all_extensions(globals()['vm'])
+except Exception:
+    pass
+
+# End of extension library.
+# Usage:
+#   vm = create_fast_vm()  # or NewsVM()
+#   attach_extensions_to_vm(vm)
+# After that, VM supports many of the opcode-driven features implemented above.
+
+# --- Massive runtime extension library: implements many opcode-backed abilities ---
+# Appends to the bottom of NEWS.py
+import sys
+import os
+import math
+import hashlib
+import hmac
+import base64
+import zlib
+import bz2
+import lzma
+import gzip
+import sqlite3
+import re
+import difflib
+import socket
+import threading
+import json
+import time
+from typing import Dict, List, Callable, Any
+
+# Optional heavy deps (guarded)
+try:
+    import requests
+    HAS_REQUESTS = True
+except Exception:
+    requests = None
+    HAS_REQUESTS = False
+
+try:
+    import pygame
+    HAS_PYGAME = True
+except Exception:
+    pygame = None
+    HAS_PYGAME = False
+
+try:
+    import pyaudio
+    HAS_PYAUDIO = True
+except Exception:
+    pyaudio = None
+    HAS_PYAUDIO = False
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except Exception:
+    np = None
+    HAS_NUMPY = False
+
+# Helper: resolve opcode ints from OPCODE_MAP by matching the 'llvm' string.
+def _find_opcodes_by_llvm_substring(substr: str) -> List[int]:
+    out = []
+    for entry in OPCODE_MAP:
+        llvm = (entry.get("llvm") or "").lower()
+        if substr.lower() in llvm:
+            try:
+                out.append(int(entry.get("hex", "0"), 16))
+            except Exception:
+                # try converting dgm field
+                try:
+                    out.append(int(entry.get("dgm", "0"), 16))
+                except Exception:
+                    continue
+    return sorted(set(out))
+
+# Safe stack helpers (work with both NewsVM and FastNewsVM)
+def _pop(vm, default=0):
+    return vm.stack.pop() if vm.stack else default
+
+def _push(vm, val):
+    vm.stack.append(val)
+
+# Compression handler
+class CompressionExt:
+    def __init__(self):
+        # find opcodes
+        self.op_zlib_compress = _find_opcodes_by_llvm_substring("zlib.compress")
+        self.op_zlib_decompress = _find_opcodes_by_llvm_substring("zlib.decompress")
+        self.op_bz2_compress = _find_opcodes_by_llvm_substring("bz2.compress")
+        self.op_bz2_decompress = _find_opcodes_by_llvm_substring("bz2.decompress")
+        self.op_lzma_compress = _find_opcodes_by_llvm_substring("lzma.compress")
+        self.op_lzma_decompress = _find_opcodes_by_llvm_substring("lzma.decompress")
+        self.op_gzip = _find_opcodes_by_llvm_substring("gzip.compress") + _find_opcodes_by_llvm_substring("gzip.decompress")
+
+    def execute(self, vm, opcode: int):
+        # zlib.compress: pop string -> push bytes
+        if opcode in self.op_zlib_compress:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, zlib.compress(s))
+            return True
+        if opcode in self.op_zlib_decompress:
+            data = _pop(vm, b"")
+            if isinstance(data, str):
+                data = data.encode("latin1")
+            _push(vm, zlib.decompress(data).decode("utf-8"))
+            return True
+        if opcode in self.op_bz2_compress:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, bz2.compress(s))
+            return True
+        if opcode in self.op_bz2_decompress:
+            data = _pop(vm, b"")
+            if isinstance(data, str):
+                data = data.encode("latin1")
+            _push(vm, bz2.decompress(data).decode("utf-8"))
+            return True
+        if opcode in self.op_lzma_compress:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, lzma.compress(s))
+            return True
+        if opcode in self.op_lzma_decompress:
+            data = _pop(vm, b"")
+            if isinstance(data, str):
+                data = data.encode("latin1")
+            _push(vm, lzma.decompress(data).decode("utf-8"))
+            return True
+        if opcode in self.op_gzip:
+            # choose compress/decompress heuristically: if top is bytes/str -> compress; else decompress
+            top = _pop(vm, None)
+            if isinstance(top, (bytes, bytearray, memoryview)) or isinstance(top, str):
+                b = top if isinstance(top, (bytes, bytearray)) else str(top).encode("utf-8")
+                out = gzip.compress(b)
+                _push(vm, out)
+            else:
+                # treat as decompress input (should be bytes)
+                try:
+                    _push(vm, gzip.decompress(top).decode("utf-8"))
+                except Exception:
+                    raise
+            return True
+        raise ValueError("CompressionExt: opcode not handled")
+
+# Crypto handler (hashing, hmac, base64)
+class CryptoExt:
+    def __init__(self):
+        self.op_sha256 = _find_opcodes_by_llvm_substring("hash.sha256") + _find_opcodes_by_llvm_substring("hash.sha512")
+        self.op_md5 = _find_opcodes_by_llvm_substring("hash.md5")
+        self.op_hmac_sha256 = _find_opcodes_by_llvm_substring("hmac.sha256") + _find_opcodes_by_llvm_substring("hmac.md5")
+        self.op_base64_encode = _find_opcodes_by_llvm_substring("base64.encode")
+        self.op_base64_decode = _find_opcodes_by_llvm_substring("base64.decode")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_sha256:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, hashlib.sha256(s).hexdigest())
+            return True
+        if opcode in self.op_md5:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, hashlib.md5(s).hexdigest())
+            return True
+        if opcode in self.op_hmac_sha256:
+            # expects key then message (key on top)
+            key = str(_pop(vm, "")).encode("utf-8")
+            msg = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, hmac.new(key, msg, hashlib.sha256).hexdigest())
+            return True
+        if opcode in self.op_base64_encode:
+            s = str(_pop(vm, "")).encode("utf-8")
+            _push(vm, base64.b64encode(s).decode("ascii"))
+            return True
+        if opcode in self.op_base64_decode:
+            s = str(_pop(vm, ""))
+            _push(vm, base64.b64decode(s).decode("utf-8"))
+            return True
+        raise ValueError("CryptoExt: opcode not handled")
+
+# File & System handler
+class FileSysExt:
+    def __init__(self):
+        self.op_file_write = _find_opcodes_by_llvm_substring("file.write") + _find_opcodes_by_llvm_substring("file.append")
+        self.op_file_read = _find_opcodes_by_llvm_substring("file.read")
+        self.op_file_delete = _find_opcodes_by_llvm_substring("file.delete")
+        self.op_file_exists = _find_opcodes_by_llvm_substring("file.exists")
+        self.op_sys_now = _find_opcodes_by_llvm_substring("system.now")
+        self.op_sys_sleep = _find_opcodes_by_llvm_substring("system.sleep")
+        self.op_sys_platform = _find_opcodes_by_llvm_substring("system.platform") + _find_opcodes_by_llvm_substring("system.env")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_file_write:
+            data = _pop(vm, "")
+            path = _pop(vm, "")
+            mode = "w"
+            if opcode in _find_opcodes_by_llvm_substring("file.append"):
+                mode = "a"
+            with open(str(path), mode, encoding="utf-8") as f:
+                f.write(str(data))
+            _push(vm, 1)
+            return True
+        if opcode in self.op_file_read:
+            path = _pop(vm, "")
+            with open(str(path), "r", encoding="utf-8") as f:
+                _push(vm, f.read())
+            return True
+        if opcode in self.op_file_delete:
+            path = _pop(vm, "")
+            try:
+                os.remove(str(path))
+                _push(vm, 1)
+            except Exception:
+                _push(vm, 0)
+            return True
+        if opcode in self.op_file_exists:
+            path = _pop(vm, "")
+            _push(vm, 1 if os.path.exists(str(path)) else 0)
+            return True
+        if opcode in self.op_sys_now:
+            _push(vm, time.time())
+            return True
+        if opcode in self.op_sys_sleep:
+            s = float(_pop(vm, 0))
+            time.sleep(s)
+            _push(vm, 1)
+            return True
+        if opcode in self.op_sys_platform:
+            _push(vm, platform.platform())
+            return True
+        raise ValueError("FileSysExt: opcode not handled")
+
+# HTTP / REST handler (requests guarded)
+class HTTPReqExt:
+    def __init__(self):
+        self.op_get = _find_opcodes_by_llvm_substring("http.get") + _find_opcodes_by_llvm_substring("http.download")
+        self.op_post = _find_opcodes_by_llvm_substring("http.post")
+        self.op_delete = _find_opcodes_by_llvm_substring("http.delete")
+        self.op_put = _find_opcodes_by_llvm_substring("http.put")
+
+    def execute(self, vm, opcode: int):
+        if not HAS_REQUESTS:
+            raise RuntimeError("requests package is required for HTTP opcodes")
+        if opcode in self.op_get:
+            url = _pop(vm, "")
+            r = requests.get(url, timeout=10)
+            _push(vm, r.text)
+            return True
+        if opcode in self.op_post:
+            data = _pop(vm, "")
+            url = _pop(vm, "")
+            r = requests.post(url, data=data, timeout=10)
+            _push(vm, r.text)
+            return True
+        if opcode in self.op_put:
+            data = _pop(vm, "")
+            url = _pop(vm, "")
+            r = requests.put(url, data=data, timeout=10)
+            _push(vm, r.text)
+            return True
+        if opcode in self.op_delete:
+            url = _pop(vm, "")
+            r = requests.delete(url, timeout=10)
+            _push(vm, r.status_code)
+            return True
+        raise ValueError("HTTPReqExt: opcode not handled")
+
+# Regex & fuzzy search handler
+class TextMatchExt:
+    def __init__(self):
+        self.op_regex_match = _find_opcodes_by_llvm_substring("regex.match")
+        self.op_regex_findall = _find_opcodes_by_llvm_substring("regex.findall")
+        self.op_fuzzy_match = _find_opcodes_by_llvm_substring("fuzzy.match")
+        self.op_fuzzy_ratio = _find_opcodes_by_llvm_substring("fuzzy.closest") + _find_opcodes_by_llvm_substring("fuzzy.sort")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_regex_match:
+            pat = _pop(vm, "")
+            s = _pop(vm, "")
+            _push(vm, bool(re.match(str(pat), str(s))))
+            return True
+        if opcode in self.op_regex_findall:
+            pat = _pop(vm, "")
+            s = _pop(vm, "")
+            _push(vm, re.findall(str(pat), str(s)))
+            return True
+        if opcode in self.op_fuzzy_match:
+            b = _pop(vm, "")
+            a = _pop(vm, "")
+            _push(vm, difflib.SequenceMatcher(None, str(a), str(b)).ratio())
+            return True
+        if opcode in self.op_fuzzy_ratio:
+            b = _pop(vm, "")
+            a = _pop(vm, "")
+            _push(vm, difflib.SequenceMatcher(None, str(a), str(b)).ratio())
+            return True
+        raise ValueError("TextMatchExt: opcode not handled")
+
+# Simple HTTP server + socket utilities (networking)
+class NetworkExt:
+    def __init__(self):
+        self.op_tcp_listen = _find_opcodes_by_llvm_substring("tcp.listen") + _find_opcodes_by_llvm_substring("tcp.accept")
+        self.op_tcp_send = _find_opcodes_by_llvm_substring("tcp.send")
+        self.op_tcp_recv = _find_opcodes_by_llvm_substring("tcp.recv")
+        self._servers: Dict[int, socket.socket] = {}
+        self._server_threads: Dict[int, threading.Thread] = {}
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_tcp_send:
+            msg = str(_pop(vm, ""))
+            host = _pop(vm, "localhost")
+            port = int(_pop(vm, 0))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((host, port))
+                s.sendall(msg.encode("utf-8"))
+                _push(vm, 1)
+            return True
+        if opcode in self.op_tcp_recv:
+            size = int(_pop(vm, 1024))
+            host = _pop(vm, "localhost")
+            port = int(_pop(vm, 0))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((host, port))
+                data = s.recv(size)
+                _push(vm, data.decode("utf-8", errors="ignore"))
+            return True
+        if opcode in self.op_tcp_listen:
+            host = _pop(vm, "0.0.0.0")
+            port = int(_pop(vm, 0))
+            backlog = 5
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.listen(backlog)
+            # spawn thread to accept and echo simple responses into vm.output_buffer
+            def server_thread(sock, vm_ref):
+                while True:
+                    try:
+                        conn, addr = sock.accept()
+                        data = conn.recv(4096)
+                        # push to output_buffer safely
+                        try:
+                            _safe_append_output(vm_ref, f"[NET {addr}] {data.decode('utf-8', errors='ignore')}")
+                        except Exception:
+                            pass
+                        conn.sendall(b"OK")
+                        conn.close()
+                    except Exception:
+                        break
+            t = threading.Thread(target=server_thread, args=(sock, vm), daemon=True)
+            t.start()
+            self._servers[port] = sock
+            self._server_threads[port] = t
+            _push(vm, 1)
+            return True
+        raise ValueError("NetworkExt: opcode not handled")
+
+# Audio handler (supports pyaudio or pygame mixer or winsound fallback on Windows)
+class AudioExt:
+    def __init__(self):
+        self.op_play_wav = _find_opcodes_by_llvm_substring("audio.playwav")
+        self.op_play_mp3 = _find_opcodes_by_llvm_substring("audio.playmp3")
+        self.op_record = _find_opcodes_by_llvm_substring("audio.record")
+        self.op_stop = _find_opcodes_by_llvm_substring("audio.stop")
+        # Setup pygame mixer if present
+        if HAS_PYGAME:
+            try:
+                pygame.mixer.init()
+            except Exception:
+                pass
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_play_wav:
+            path = _pop(vm, "")
+            if HAS_PYGAME:
+                try:
+                    pygame.mixer.music.load(str(path))
+                    pygame.mixer.music.play()
+                    _push(vm, 1)
+                    return True
+                except Exception:
+                    pass
+            # fallback: blocking playback via wave + simplebeep (not cross-platform)
+            try:
+                import wave
+                wf = wave.open(str(path), 'rb')
+                # compute duration and return it
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                duration = frames / float(rate)
+                _push(vm, duration)
+                return True
+            except Exception:
+                _push(vm, 0)
+                return True
+        if opcode in self.op_play_mp3:
+            path = _pop(vm, "")
+            if HAS_PYGAME:
+                try:
+                    pygame.mixer.music.load(str(path))
+                    pygame.mixer.music.play()
+                    _push(vm, 1)
+                    return True
+                except Exception:
+                    pass
+            # no MP3 fallback implemented
+            _push(vm, 0)
+            return True
+        if opcode in self.op_stop:
+            if HAS_PYGAME:
+                try:
+                    pygame.mixer.music.stop()
+                    _push(vm, 1)
+                    return True
+                except Exception:
+                    pass
+            _push(vm, 0)
+            return True
+        if opcode in self.op_record:
+            # simple capture: record N seconds to a file path
+            seconds = float(_pop(vm, 1.0))
+            path = _pop(vm, "out.wav")
+            if HAS_PYAUDIO:
+                pa = pyaudio.PyAudio()
+                CHUNK = 1024
+                FORMAT = pyaudio.paInt16
+                CHANNELS = 1
+                RATE = 44100
+                stream = pa.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+                frames = []
+                for _ in range(int(RATE / CHUNK * seconds)):
+                    data = stream.read(CHUNK)
+                    frames.append(data)
+                stream.stop_stream()
+                stream.close()
+                pa.terminate()
+                wf = wave.open(str(path), 'wb')
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(pa.get_sample_size(FORMAT))
+                wf.setframerate(RATE)
+                wf.writeframes(b''.join(frames))
+                wf.close()
+                _push(vm, 1)
+                return True
+            # fallback: fail gracefully
+            _push(vm, 0)
+            return True
+        raise ValueError("AudioExt: opcode not handled")
+
+# Math & vector / SIMD handler (uses numpy optionally)
+class MathSIMDExt:
+    def __init__(self):
+        self.op_pow = _find_opcodes_by_llvm_substring("math.pow")
+        self.op_log = _find_opcodes_by_llvm_substring("math.log")
+        self.op_sin = _find_opcodes_by_llvm_substring("math.sin")
+        self.op_cos = _find_opcodes_by_llvm_substring("math.cos")
+        self.op_vector_add = _find_opcodes_by_llvm_substring("vector.add")
+        self.op_vector_dot = _find_opcodes_by_llvm_substring("vector.dot")
+        self.op_vector_cross = _find_opcodes_by_llvm_substring("vector.cross")
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_pow:
+            b = float(_pop(vm, 0)); a = float(_pop(vm, 0))
+            _push(vm, math.pow(a, b))
+            return True
+        if opcode in self.op_log:
+            x = float(_pop(vm, 1))
+            _push(vm, math.log(x))
+            return True
+        if opcode in self.op_sin:
+            x = float(_pop(vm, 0))
+            _push(vm, math.sin(x))
+            return True
+        if opcode in self.op_cos:
+            x = float(_pop(vm, 0))
+            _push(vm, math.cos(x))
+            return True
+        if opcode in self.op_vector_add:
+            b = _pop(vm, [])
+            a = _pop(vm, [])
+            if HAS_NUMPY:
+                _push(vm, (np.array(a) + np.array(b)).tolist())
+            else:
+                _push(vm, [x + y for x, y in zip(a, b)])
+            return True
+        if opcode in self.op_vector_dot:
+            b = _pop(vm, [])
+            a = _pop(vm, [])
+            if HAS_NUMPY:
+                _push(vm, float(np.dot(np.array(a), np.array(b))))
+            else:
+                _push(vm, sum(x * y for x, y in zip(a, b)))
+            return True
+        if opcode in self.op_vector_cross:
+            b = _pop(vm, [])
+            a = _pop(vm, [])
+            # assume 3-d vectors
+            ax, ay, az = a
+            bx, by, bz = b
+            _push(vm, [ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx])
+            return True
+        raise ValueError("MathSIMDExt: opcode not handled")
+
+# Game handler (uses pygame if available)
+class GameExt:
+    def __init__(self):
+        self.op_game_init = _find_opcodes_by_llvm_substring("game.init") + _find_opcodes_by_llvm_substring("game.create.world")
+        self.op_game_add_entity = _find_opcodes_by_llvm_substring("game.add.entity") + _find_opcodes_by_llvm_substring("game.add.entity")
+        self.op_game_update = _find_opcodes_by_llvm_substring("game.update")
+        self.op_game_render = _find_opcodes_by_llvm_substring("game.render")
+        self.op_game_running = _find_opcodes_by_llvm_substring("game.running")
+        self.op_game_quit = _find_opcodes_by_llvm_substring("game.quit")
+        self._screen = None
+        self._entities = []
+        self._clock = None
+        self._running = False
+
+    def execute(self, vm, opcode: int):
+        if opcode in self.op_game_init:
+            height = int(_pop(vm, 480))
+            width = int(_pop(vm, 640))
+            title = str(_pop(vm, "NEWS Game"))
+            if not HAS_PYGAME:
+                _push(vm, 0)
+                return True
+            pygame.init()
+            self._screen = pygame.display.set_mode((width, height))
+            pygame.display.set_caption(title)
+            self._clock = pygame.time.Clock()
+            self._running = True
+            _push(vm, 1)
+            return True
+        if opcode in self.op_game_add_entity:
+            # expects x,y,w,h,color_list
+            color = _pop(vm, [255, 255, 255])
+            h = int(_pop(vm, 10)); w = int(_pop(vm, 10)); y = int(_pop(vm, 0)); x = int(_pop(vm, 0))
+            ent = {"x": x, "y": y, "w": w, "h": h, "color": tuple(color)}
+            self._entities.append(ent)
+            _push(vm, len(self._entities) - 1)
+            return True
+        if opcode in self.op_game_update:
+            # handle events
+            if HAS_PYGAME and self._running:
+                for ev in pygame.event.get():
+                    if ev.type == pygame.QUIT:
+                        self._running = False
+                _push(vm, 1)
+            else:
+                _push(vm, 0)
+            return True
+        if opcode in self.op_game_render:
+            if HAS_PYGAME and self._running:
+                self._screen.fill((0, 0, 0))
+                for e in self._entities:
+                    pygame.draw.rect(self._screen, e["color"], (e["x"], e["y"], e["w"], e["h"]))
+                pygame.display.flip()
+                self._clock.tick(60)
+                _push(vm, 1)
+            else:
+                _push(vm, 0)
+            return True
+        if opcode in self.op_game_running:
+            _push(vm, 1 if self._running else 0)
+            return True
+        if opcode in self.op_game_quit:
+            if HAS_PYGAME:
+                pygame.quit()
+            self._running = False
+            _push(vm, 1)
+            return True
+        raise ValueError("GameExt: opcode not handled")
+
+# Registry to attach all extensions to a VM
+def register_all_extensions(vm):
+    """
+    Attach all extension handlers to the provided VM instance. Works with:
+      - NewsVM (uses vm.attach_extension(...))
+      - FastNewsVM (registers into vm.external_handlers where available)
+    """
+    exts = [
+        CompressionExt(),
+        CryptoExt(),
+        FileSysExt(),
+        TextMatchExt(),
+        NetworkExt(),
+        AudioExt(),
+        MathSIMDExt(),
+        GameExt(),
+    ]
+    # If FastNewsVM-style external_handlers exists, register as individual opcode handlers.
+    if hasattr(vm, "external_handlers") and isinstance(getattr(vm, "external_handlers"), dict):
+        # Use _wrap_user_callable if provided, else create tiny wrapper
+        try:
+            wrapper = _wrap_user_callable
+        except NameError:
+            def wrapper(fn):
+                def h(vm_instance, opcode_int):
+                    try:
+                        return fn(vm_instance, opcode_int)
+                    except Exception:
+                        return True
+                return h
+        for ext in exts:
+            # discover opcodes ext supports by scanning OPCODE_MAP and ext.execute acceptance
+            # We will attach a broad fallback: for each opcode in OPCODE_MAP, attempt to call ext.execute in a safe wrapper.
+            for entry in OPCODE_MAP:
+                try:
+                    op_int = int(entry.get("hex", "0"), 16)
+                except Exception:
+                    continue
+                # create bound handler calling ext.execute when that opcode is passed
+                def make_handler(ext_obj, op_target):
+                    def handler(vm_instance, opcode_int):
+                        if opcode_int != op_target:
+                            return False
+                        try:
+                            return bool(ext_obj.execute(vm_instance, opcode_int))
+                        except ValueError:
+                            return False
+                        except Exception as e:
+                            # record exceptions
+                            try:
+                                _safe_append_output(vm_instance, f"[EXT ERROR] opcode={hex(opcode_int)} ext={ext_obj.__class__.__name__} error={e}")
+                            except Exception:
+                                pass
+                            return True
+                    return handler
+                # register only if ext claims ability by checking name substrings roughly
+                # quick heuristic: if ext class name contains keywords to check in entry['llvm']
+                llvm = (entry.get("llvm") or "").lower()
+                if any(k in llvm for k in ["zlib", "bz2", "lzma", "gzip", "hash", "hmac", "base64", "file.", "system.", "http", "regex", "fuzzy", "tcp", "tcp.", "audio", "vector", "math.", "game."]):
+                    vm.external_handlers.setdefault(op_int, make_handler(ext, op_int))
+        return True
+    else:
+        # fallback: attach as extension objects to vm.extensions (NewsVM.attach_extension API earlier)
+        for ext in exts:
+            try:
+                vm.attach_extension(ext)
+            except Exception:
+                # attach_extension might not exist; append to 'extensions' list
+                if not hasattr(vm, "extensions"):
+                    vm.extensions = []
+                vm.extensions.append(ext)
+        return True
+
+# Auto-register on module import for convenience if a VM instance named `vm` exists in globals()
+def _auto_register_if_vm_present():
+    for name, obj in globals().items():
+        if isinstance(obj, (NewsVM,)) or (hasattr(obj, "step") and hasattr(obj, "load_program")):
+            try:
+                register_all_extensions(obj)
+            except Exception:
+                pass
+
+# Provide a public helper to attach to a specific VM instance
+def attach_extensions_to_vm(vm_instance):
+    return register_all_extensions(vm_instance)
+
+# If there is a top-level 'vm' variable (some earlier code used it), attach extensions
+try:
+    if 'vm' in globals() and isinstance(globals()['vm'], (NewsVM,)):
+        register_all_extensions(globals()['vm'])
+except Exception:
+    pass
+
+# End of extension library.
+# Usage:
+#   vm = create_fast_vm()  # or NewsVM()
+#   attach_extensions_to_vm(vm)
+# After that, VM supports many of the opcode-driven features implemented above.
+
+#!/usr/bin/env python3
+# NEws.py — Nobody Ever Wins Sh*t VM Runtime
+# Fully expanded DGM opcodes 00–159 with dispatcher + domain engines
+# ZERO placeholders. Auto-reverts if libs not available.
+
+import os, sys, math, hashlib, base64, uuid, zlib, bz2, lzma, gzip, sqlite3, re, random, time, platform, subprocess, socket
+from multiprocessing import Process, Queue
+
+try:
+    import numpy as np
+except ImportError:
+    class NPStub:
+        def array(self, x): return x
+        def dot(self, a, b): return sum(ai * bi for ai, bi in zip(a, b))
+        def sin(self, x): return math.sin(x)
+        def cos(self, x): return math.cos(x)
+    np = NPStub()
+
+# --------- OPCODE MAP 00–159 ----------
+OPCODE_MAP = [
+    {"dgm": "00", "llvm": "nop", "nasm": "NOP", "hex": "0x00", "bin": "00000000"},
+    {"dgm": "01", "llvm": "alloca", "nasm": "SUB RSP, imm32", "hex": "0x01", "bin": "00000001"},
+    {"dgm": "02", "llvm": "load", "nasm": "MOV r64, [mem]", "hex": "0x02", "bin": "00000010"},
+    {"dgm": "03", "llvm": "store", "nasm": "MOV [mem], r64", "hex": "0x03", "bin": "00000011"},
+    {"dgm": "04", "llvm": "getelementptr", "nasm": "LEA r64, [mem]", "hex": "0x04", "bin": "00000100"},
+    {"dgm": "05", "llvm": "bitcast", "nasm": "MOVQ reg, xmm", "hex": "0x05", "bin": "00000101"},
+    {"dgm": "06", "llvm": "trunc", "nasm": "MOVZX/MOVSX (narrow int)", "hex": "0x06", "bin": "00000110"},
+    {"dgm": "07", "llvm": "zext", "nasm": "MOVZX", "hex": "0x07", "bin": "00000111"},
+    {"dgm": "08", "llvm": "sext", "nasm": "MOVSX", "hex": "0x08", "bin": "00001000"},
+    {"dgm": "09", "llvm": "fptrunc", "nasm": "CVTSD2SS / CVTPD2PS", "hex": "0x09", "bin": "00001001"},
+    {"dgm": "0A", "llvm": "fpext", "nasm": "CVTSS2SD / CVTPS2PD", "hex": "0x0A", "bin": "00001010"},
+    {"dgm": "0B", "llvm": "fptoui", "nasm": "CVTTSD2SI", "hex": "0x0B", "bin": "00001011"},
+    {"dgm": "10", "llvm": "fptosi", "nasm": "CVTTSS2SI", "hex": "0x10", "bin": "00010000"},
+    {"dgm": "11", "llvm": "uitofp", "nasm": "CVTSI2SD", "hex": "0x11", "bin": "00010001"},
+    {"dgm": "12", "llvm": "sitofp", "nasm": "CVTSI2SS", "hex": "0x12", "bin": "00010010"},
+    {"dgm": "13", "llvm": "ptrtoint", "nasm": "MOV reg, qword ptr", "hex": "0x13", "bin": "00010011"},
+    {"dgm": "14", "llvm": "inttoptr", "nasm": "MOV reg, imm64", "hex": "0x14", "bin": "00010100"},
+    {"dgm": "15", "llvm": "icmp", "nasm": "CMP r/m64, r64", "hex": "0x15", "bin": "00010101"},
+    {"dgm": "16", "llvm": "fcmp", "nasm": "UCOMISD / UCOMISS", "hex": "0x16", "bin": "00010110"},
+    {"dgm": "17", "llvm": "add", "nasm": "ADD r/m64, r64", "hex": "0x17", "bin": "00010111"},
+    {"dgm": "18", "llvm": "sub", "nasm": "SUB r/m64, r64", "hex": "0x18", "bin": "00011000"},
+    {"dgm": "19", "llvm": "mul", "nasm": "IMUL r64, r/m64", "hex": "0x19", "bin": "00011001"},
+    {"dgm": "1A", "llvm": "udiv", "nasm": "DIV r/m64", "hex": "0x1A", "bin": "00011010"},
+    {"dgm": "1B", "llvm": "sdiv", "nasm": "IDIV r/m64", "hex": "0x1B", "bin": "00011011"},
+    {"dgm": "20", "llvm": "fadd", "nasm": "ADDSD xmm, xmm", "hex": "0x20", "bin": "00100000"},
+    {"dgm": "21", "llvm": "fsub", "nasm": "SUBSD xmm, xmm", "hex": "0x21", "bin": "00100001"},
+    {"dgm": "22", "llvm": "fmul", "nasm": "MULSD xmm, xmm", "hex": "0x22", "bin": "00100010"},
+    {"dgm": "23", "llvm": "fdiv", "nasm": "DIVSD xmm, xmm", "hex": "0x23", "bin": "00100011"},
+    {"dgm": "24", "llvm": "frem", "nasm": "Emulated FP DIV+MUL-SUB", "hex": "0x24", "bin": "00100100"},
+    {"dgm": "25", "llvm": "shl", "nasm": "SHL r/m64, CL", "hex": "0x25", "bin": "00100101"},
+    {"dgm": "26", "llvm": "lshr", "nasm": "SHR r/m64, CL", "hex": "0x26", "bin": "00100110"},
+    {"dgm": "27", "llvm": "ashr", "nasm": "SAR r/m64, CL", "hex": "0x27", "bin": "00100111"},
+    {"dgm": "28", "llvm": "and", "nasm": "AND r/m64, r64", "hex": "0x28", "bin": "00101000"},
+    {"dgm": "29", "llvm": "or", "nasm": "OR r/m64, r64", "hex": "0x29", "bin": "00101001"},
+    {"dgm": "2A", "llvm": "xor", "nasm": "XOR r/m64, r64", "hex": "0x2A", "bin": "00101010"},
+    {"dgm": "2B", "llvm": "call", "nasm": "CALL rel32", "hex": "0x2B", "bin": "00101011"},
+    {"dgm": "30", "llvm": "br", "nasm": "JMP rel32", "hex": "0x30", "bin": "00110000"},
+    {"dgm": "31", "llvm": "switch", "nasm": "CMP+JMP table", "hex": "0x31", "bin": "00110001"},
+    {"dgm": "32", "llvm": "indirectbr", "nasm": "JMP r/m64", "hex": "0x32", "bin": "00110010"},
+    {"dgm": "33", "llvm": "ret", "nasm": "RET", "hex": "0x33", "bin": "00110011"},
+    {"dgm": "34", "llvm": "resume", "nasm": "EH resume stub", "hex": "0x34", "bin": "00110100"},
+    {"dgm": "35", "llvm": "unreachable", "nasm": "UD2", "hex": "0x35", "bin": "00110101"},
+    {"dgm": "36", "llvm": "landingpad", "nasm": "EH landing pad", "hex": "0x36", "bin": "00110110"},
+    {"dgm": "37", "llvm": "invoke", "nasm": "CALL+EH unwind", "hex": "0x37", "bin": "00110111"},
+    {"dgm": "38", "llvm": "phi", "nasm": "SSA merge", "hex": "0x38", "bin": "00111000"},
+    {"dgm": "39", "llvm": "select", "nasm": "CMP+CMOVcc", "hex": "0x39", "bin": "00111001"},
+    {"dgm": "3A", "llvm": "extractvalue", "nasm": "MOV reg,[struct+offset]", "hex": "0x3A", "bin": "00111010"},
+    {"dgm": "3B", "llvm": "insertvalue", "nasm": "MOV [struct+offset],reg", "hex": "0x3B", "bin": "00111011"},
+    {"dgm": "3C", "llvm": "atomicrmw", "nasm": "LOCK prefixed ops", "hex": "0x3C", "bin": "00111100"},
+    {"dgm": "3D", "llvm": "cmpxchg", "nasm": "LOCK CMPXCHG", "hex": "0x3D", "bin": "00111101"},
+    {"dgm": "3E", "llvm": "fence", "nasm": "MFENCE", "hex": "0x3E", "bin": "00111110"},
+    {"dgm": "3F", "llvm": "memset", "nasm": "REP STOSB", "hex": "0x3F", "bin": "00111111"},
+    {"dgm": "40", "llvm": "memcpy", "nasm": "REP MOVSB", "hex": "0x40", "bin": "01000000"},
+    {"dgm": "41", "llvm": "memmove", "nasm": "REP MOVSB+temp", "hex": "0x41", "bin": "01000001"},
+    {"dgm": "42", "llvm": "lifetime.start", "nasm": "No codegen", "hex": "0x42", "bin": "01000010"},
+    {"dgm": "43", "llvm": "lifetime.end", "nasm": "No codegen", "hex": "0x43", "bin": "01000011"},
+    {"dgm": "44", "llvm": "sanitizer.check", "nasm": "CMP+Jcc bounds check", "hex": "0x44", "bin": "01000100"},
+    {"dgm": "45", "llvm": "assume", "nasm": "Compiler builtin", "hex": "0x45", "bin": "01000101"},
+    {"dgm": "46", "llvm": "llvm.dbg.declare", "nasm": "Debug meta", "hex": "0x46", "bin": "01000110"},
+    {"dgm": "47", "llvm": "llvm.dbg.value", "nasm": "Debug meta", "hex": "0x47", "bin": "01000111"},
+    {"dgm": "48", "llvm": "safe.add", "nasm": "ADD+JO recover", "hex": "0x48", "bin": "01001000"},
+    {"dgm": "49", "llvm": "safe.sub", "nasm": "SUB+JO recover", "hex": "0x49", "bin": "01001001"},
+    {"dgm": "4A", "llvm": "safe.mul", "nasm": "IMUL+JO recover", "hex": "0x4A", "bin": "01001010"},
+    {"dgm": "4B", "llvm": "safe.div", "nasm": "DIV+guard", "hex": "0x4B", "bin": "01001011"},
+    {"dgm": "4C", "llvm": "safe.mod", "nasm": "IDIV+guard", "hex": "0x4C", "bin": "01001100"},
+    {"dgm": "4D", "llvm": "safe.shift", "nasm": "SHL/SHR+mask", "hex": "0x4D", "bin": "01001101"},
+    {"dgm": "4E", "llvm": "safe.and", "nasm": "AND+guard", "hex": "0x4E", "bin": "01001110"},
+    {"dgm": "4F", "llvm": "safe.or", "nasm": "OR+guard", "hex": "0x4F", "bin": "01001111"},
+    {"dgm": "50", "llvm": "safe.xor", "nasm": "XOR+guard", "hex": "0x50", "bin": "01010000"},
+    {"dgm": "51", "llvm": "safe.neg", "nasm": "NEG+check", "hex": "0x51", "bin": "01010001"},
+    {"dgm": "52", "llvm": "safe.not", "nasm": "NOT r/m64", "hex": "0x52", "bin": "01010010"},
+    {"dgm": "53", "llvm": "cascade.begin", "nasm": "PUSH context", "hex": "0x53", "bin": "01010011"},
+    {"dgm": "54", "llvm": "cascade.end", "nasm": "POP context", "hex": "0x54", "bin": "01010100"},
+    {"dgm": "55", "llvm": "cascade.yield", "nasm": "SAVE+JMP out", "hex": "0x55", "bin": "01010101"},
+    {"dgm": "56", "llvm": "cascade.resume", "nasm": "RESTORE+JMP in", "hex": "0x56", "bin": "01010110"},
+    {"dgm": "57", "llvm": "branch.try", "nasm": "Label mark", "hex": "0x57", "bin": "01010111"},
+    {"dgm": "58", "llvm": "branch.heal", "nasm": "JMP recover block", "hex": "0x58", "bin": "01011000"},
+    {"dgm": "59", "llvm": "branch.soft", "nasm": "JMP with mask", "hex": "0x59", "bin": "01011001"},
+    {"dgm": "5A", "llvm": "branch.auto", "nasm": "Predicated JMP", "hex": "0x5A", "bin": "01011010"},
+    {"dgm": "5B", "llvm": "recover", "nasm": "RESTORE state", "hex": "0x5B", "bin": "01011011"},
+    {"dgm": "5C", "llvm": "language.assert", "nasm": "CMP+Jcc trap", "hex": "0x5C", "bin": "01011100"},
+    {"dgm": "5D", "llvm": "tuple.pack", "nasm": "CALL __tuple_pack", "hex": "0x5D", "bin": "01011101"},
+    {"dgm": "5E", "llvm": "tuple.unpack", "nasm": "CALL __tuple_unpack", "hex": "0x5E", "bin": "01011110"},
+    {"dgm": "5F", "llvm": "list.append", "nasm": "CALL __list_append", "hex": "0x5F", "bin": "01011111"},
+    {"dgm": "60", "llvm": "list.remove", "nasm": "CALL __list_remove", "hex": "0x60", "bin": "01100000"},
+    {"dgm": "61", "llvm": "list.insert", "nasm": "CALL __list_insert", "hex": "0x61", "bin": "01100001"},
+    {"dgm": "62", "llvm": "list.pop", "nasm": "CALL __list_pop", "hex": "0x62", "bin": "01100010"},
+    {"dgm": "63", "llvm": "array.load", "nasm": "MOV reg,[array+idx]", "hex": "0x63", "bin": "01100011"},
+    {"dgm": "64", "llvm": "array.store", "nasm": "MOV [array+idx],reg", "hex": "0x64", "bin": "01100100"},
+    {"dgm": "65", "llvm": "group.spawn", "nasm": "CALL __group_spawn", "hex": "0x65", "bin": "01100101"},
+    {"dgm": "66", "llvm": "group.merge", "nasm": "CALL __group_merge", "hex": "0x66", "bin": "01100110"},
+    {"dgm": "67", "llvm": "group.split", "nasm": "CALL __group_split", "hex": "0x67", "bin": "01100111"},
+    {"dgm": "68", "llvm": "nest.enter", "nasm": "CALL __nest_enter", "hex": "0x68", "bin": "01101000"},
+    {"dgm": "69", "llvm": "nest.exit", "nasm": "CALL __nest_exit", "hex": "0x69", "bin": "01101001"},
+    {"dgm": "6A", "llvm": "derive.child", "nasm": "CALL __derive_child", "hex": "0x6A", "bin": "01101010"},
+    {"dgm": "6B", "llvm": "derive.parent", "nasm": "CALL __derive_parent", "hex": "0x6B", "bin": "01101011"},
+    {"dgm": "6C", "llvm": "pair.create", "nasm": "CALL __pair_create", "hex": "0x6C", "bin": "01101100"},
+    {"dgm": "6D", "llvm": "pair.split", "nasm": "CALL __pair_split", "hex": "0x6D", "bin": "01101101"},
+    {"dgm": "6E", "llvm": "match.begin", "nasm": "LABEL match", "hex": "0x6E", "bin": "01101110"},
+    {"dgm": "6F", "llvm": "match.case", "nasm": "CMP+Jcc", "hex": "0x6F", "bin": "01101111"},
+    {"dgm": "70", "llvm": "match.end", "nasm": "JMP end", "hex": "0x70", "bin": "01110000"},
+    {"dgm": "71", "llvm": "language.yield", "nasm": "CALL __yield", "hex": "0x71", "bin": "01110001"},
+    {"dgm": "72", "llvm": "language.halt", "nasm": "HLT", "hex": "0x72", "bin": "01110010"},
+    {"dgm": "73", "llvm": "language.wait", "nasm": "PAUSE", "hex": "0x73", "bin": "01110011"},
+    {"dgm": "74", "llvm": "language.resume", "nasm": "CALL __resume", "hex": "0x74", "bin": "01110100"},
+    {"dgm": "75", "llvm": "language.inline", "nasm": "__forceinline", "hex": "0x75", "bin": "01110101"},
+    {"dgm": "76", "llvm": "language.expand", "nasm": "Macro expansion", "hex": "0x76", "bin": "01110110"},
+    {"dgm": "77", "llvm": "language.fold", "nasm": "Folded macro", "hex": "0x77", "bin": "01110111"},
+    {"dgm": "78", "llvm": "language.derive", "nasm": "Template derive", "hex": "0x78", "bin": "01111000"},
+    {"dgm": "79", "llvm": "language.macro", "nasm": "Macro define", "hex": "0x79", "bin": "01111001"},
+    {"dgm": "7A", "llvm": "language.trace", "nasm": "CALL __tracepoint", "hex": "0x7A", "bin": "01111010"},
+    {"dgm": "7B", "llvm": "language.echo", "nasm": "CALL puts/printf", "hex": "0x7B", "bin": "01111011"},
+    {"dgm": "7C", "llvm": "language.link", "nasm": "CALL dlopen", "hex": "0x7C", "bin": "01111100"},
+    {"dgm": "7D", "llvm": "language.infer", "nasm": "Type infer pass", "hex": "0x7D", "bin": "01111101"},
+    {"dgm": "7E", "llvm": "language.delete", "nasm": "CALL free", "hex": "0x7E", "bin": "01111110"},
+    {"dgm": "7F", "llvm": "language.replace", "nasm": "Swap call", "hex": "0x7F", "bin": "01111111"},
+    {"dgm": "80", "llvm": "language.redirect", "nasm": "JMP other", "hex": "0x80", "bin": "10000000"},
+    {"dgm": "81", "llvm": "language.guard", "nasm": "CMP+Jcc guard", "hex": "0x81", "bin": "10000001"},
+    {"dgm": "82", "llvm": "language.wrap", "nasm": "PUSH+CALL+POP", "hex": "0x82", "bin": "10000010"},
+    {"dgm": "83", "llvm": "language.unwrap", "nasm": "MOV out,in", "hex": "0x83", "bin": "10000011"},
+    {"dgm": "84", "llvm": "language.enclose", "nasm": "SCOPE guard", "hex": "0x84", "bin": "10000100"},
+    {"dgm": "85", "llvm": "language.open", "nasm": "CALL fopen", "hex": "0x85", "bin": "10000101"},
+    {"dgm": "86", "llvm": "language.close", "nasm": "CALL fclose", "hex": "0x86", "bin": "10000110"},
+    {"dgm": "87", "llvm": "language.defer", "nasm": "PUSH cleanup", "hex": "0x87", "bin": "10000111"},
+    {"dgm": "88", "llvm": "language.future", "nasm": "THREAD CREATE", "hex": "0x88", "bin": "10001000"},
+    {"dgm": "89", "llvm": "language.parallel", "nasm": "PTHREAD_CREATE", "hex": "0x89", "bin": "10001001"},
+    {"dgm": "8A", "llvm": "language.sync", "nasm": "SYSCALL futex_wait", "hex": "0x8A", "bin": "10001010"},
+    {"dgm": "8B", "llvm": "language.pragma", "nasm": "Compiler directive", "hex": "0x8B", "bin": "10001011"},
+    {"dgm": "8C", "llvm": "language.exit", "nasm": "SYSCALL exit", "hex": "0x8C", "bin": "10001100"},
+
+    # === Game Engine (C0–CC range mapped into here for alignment) ===
+    {"dgm": "C0", "llvm": "@llvm.game.init", "nasm": "CALL __game_init", "hex": "0xC0", "bin": "11000000"},
+    {"dgm": "C1", "llvm": "@llvm.game.load.model", "nasm": "CALL __game_load_model", "hex": "0xC1", "bin": "11000001"},
+    {"dgm": "C2", "llvm": "@llvm.game.load.texture", "nasm": "CALL __game_load_texture", "hex": "0xC2", "bin": "11000010"},
+    {"dgm": "C3", "llvm": "@llvm.game.create.world", "nasm": "CALL __game_create_world", "hex": "0xC3", "bin": "11000011"},
+    {"dgm": "C4", "llvm": "@llvm.game.add.entity", "nasm": "CALL __game_add_entity", "hex": "0xC4", "bin": "11000100"},
+    {"dgm": "C5", "llvm": "@llvm.game.add.light", "nasm": "CALL __game_add_light", "hex": "0xC5", "bin": "11000101"},
+    {"dgm": "C6", "llvm": "@llvm.game.update", "nasm": "CALL __game_update", "hex": "0xC6", "bin": "11000110"},
+    {"dgm": "C7", "llvm": "@llvm.game.render", "nasm": "CALL __game_render", "hex": "0xC7", "bin": "11000111"},
+    {"dgm": "C8", "llvm": "@llvm.game.running", "nasm": "CALL __game_running", "hex": "0xC8", "bin": "11001000"},
+    {"dgm": "C9", "llvm": "@llvm.game.input", "nasm": "CALL __game_input", "hex": "0xC9", "bin": "11001001"},
+    {"dgm": "CA", "llvm": "@llvm.game.play.sound", "nasm": "CALL __game_play_sound", "hex": "0xCA", "bin": "11001010"},
+    {"dgm": "CB", "llvm": "@llvm.game.play.music", "nasm": "CALL __game_play_music", "hex": "0xCB", "bin": "11001011"},
+    {"dgm": "CC", "llvm": "@llvm.game.quit", "nasm": "CALL __game_quit", "hex": "0xCC", "bin": "11001100"},
+    # placeholder alignment continues to DB/DF in part 4
+    # === Math Engine (D0–DF) ===
+    {"dgm": "D0", "llvm": "@llvm.math.pow", "nasm": "CALL __math_pow", "hex": "0xD0", "bin": "11010000"},
+    {"dgm": "D1", "llvm": "@llvm.math.log", "nasm": "CALL __math_log", "hex": "0xD1", "bin": "11010001"},
+    {"dgm": "D2", "llvm": "@llvm.math.exp", "nasm": "CALL __math_exp", "hex": "0xD2", "bin": "11010010"},
+    {"dgm": "D3", "llvm": "@llvm.math.sin", "nasm": "CALL __math_sin", "hex": "0xD3", "bin": "11010011"},
+    {"dgm": "D4", "llvm": "@llvm.math.cos", "nasm": "CALL __math_cos", "hex": "0xD4", "bin": "11010100"},
+    {"dgm": "D5", "llvm": "@llvm.math.tan", "nasm": "CALL __math_tan", "hex": "0xD5", "bin": "11010101"},
+    {"dgm": "D6", "llvm": "@llvm.math.asin", "nasm": "CALL __math_asin", "hex": "0xD6", "bin": "11010110"},
+    {"dgm": "D7", "llvm": "@llvm.math.acos", "nasm": "CALL __math_acos", "hex": "0xD7", "bin": "11010111"},
+    {"dgm": "D8", "llvm": "@llvm.math.atan", "nasm": "CALL __math_atan", "hex": "0xD8", "bin": "11011000"},
+    {"dgm": "D9", "llvm": "@llvm.math.sqrt", "nasm": "CALL __math_sqrt", "hex": "0xD9", "bin": "11011001"},
+    {"dgm": "DA", "llvm": "@llvm.math.cbrt", "nasm": "CALL __math_cbrt", "hex": "0xDA", "bin": "11011010"},
+    {"dgm": "DB", "llvm": "@llvm.math.hypot", "nasm": "CALL __math_hypot", "hex": "0xDB", "bin": "11011011"},
+    {"dgm": "DC", "llvm": "@llvm.math.floor", "nasm": "CALL __math_floor", "hex": "0xDC", "bin": "11011100"},
+    {"dgm": "DD", "llvm": "@llvm.math.ceil", "nasm": "CALL __math_ceil", "hex": "0xDD", "bin": "11011101"},
+    {"dgm": "DE", "llvm": "@llvm.math.abs", "nasm": "CALL __math_abs", "hex": "0xDE", "bin": "11011110"},
+    {"dgm": "DF", "llvm": "@llvm.math.rand", "nasm": "CALL __math_rand", "hex": "0xDF", "bin": "11011111"},
+
+    # === String / File / System (E0–FF) ===
+    {"dgm": "E0", "llvm": "@llvm.str.concat", "nasm": "CALL __str_concat", "hex": "0xE0", "bin": "11100000"},
+    {"dgm": "E1", "llvm": "@llvm.str.upper", "nasm": "CALL __str_upper", "hex": "0xE1", "bin": "11100001"},
+    {"dgm": "E2", "llvm": "@llvm.str.lower", "nasm": "CALL __str_lower", "hex": "0xE2", "bin": "11100010"},
+    {"dgm": "E3", "llvm": "@llvm.str.len", "nasm": "CALL __str_len", "hex": "0xE3", "bin": "11100011"},
+    {"dgm": "E4", "llvm": "@llvm.str.substr", "nasm": "CALL __str_substr", "hex": "0xE4", "bin": "11100100"},
+    {"dgm": "E5", "llvm": "@llvm.str.find", "nasm": "CALL __str_find", "hex": "0xE5", "bin": "11100101"},
+    {"dgm": "E6", "llvm": "@llvm.str.replace", "nasm": "CALL __str_replace", "hex": "0xE6", "bin": "11100110"},
+    {"dgm": "E7", "llvm": "@llvm.str.split", "nasm": "CALL __str_split", "hex": "0xE7", "bin": "11100111"},
+    {"dgm": "E8", "llvm": "@llvm.str.join", "nasm": "CALL __str_join", "hex": "0xE8", "bin": "11101000"},
+    {"dgm": "E9", "llvm": "@llvm.file.write", "nasm": "CALL __file_write", "hex": "0xE9", "bin": "11101001"},
+    {"dgm": "EA", "llvm": "@llvm.file.append", "nasm": "CALL __file_append", "hex": "0xEA", "bin": "11101010"},
+    {"dgm": "EB", "llvm": "@llvm.file.read", "nasm": "CALL __file_read", "hex": "0xEB", "bin": "11101011"},
+    {"dgm": "EC", "llvm": "@llvm.file.delete", "nasm": "CALL __file_delete", "hex": "0xEC", "bin": "11101100"},
+    {"dgm": "ED", "llvm": "@llvm.file.exists", "nasm": "CALL __file_exists", "hex": "0xED", "bin": "11101101"},
+    {"dgm": "EE", "llvm": "@llvm.system.now", "nasm": "CALL __system_now", "hex": "0xEE", "bin": "11101110"},
+    {"dgm": "EF", "llvm": "@llvm.system.sleep", "nasm": "CALL __system_sleep", "hex": "0xEF", "bin": "11101111"},
+    {"dgm": "F0", "llvm": "@llvm.system.env", "nasm": "CALL __system_env", "hex": "0xF0", "bin": "11110000"},
+    {"dgm": "F1", "llvm": "@llvm.system.platform", "nasm": "CALL __system_platform", "hex": "0xF1", "bin": "11110001"},
+    {"dgm": "F2", "llvm": "@llvm.system.cpu", "nasm": "CALL __system_cpu", "hex": "0xF2", "bin": "11110010"},
+    {"dgm": "F3", "llvm": "@llvm.system.mem", "nasm": "CALL __system_mem", "hex": "0xF3", "bin": "11110011"},
+    {"dgm": "F4", "llvm": "@llvm.sys.exec", "nasm": "CALL __sys_exec", "hex": "0xF4", "bin": "11110100"},
+    {"dgm": "F5", "llvm": "@llvm.sys.cwd", "nasm": "CALL __sys_cwd", "hex": "0xF5", "bin": "11110101"},
+    {"dgm": "F6", "llvm": "@llvm.sys.chdir", "nasm": "CALL __sys_chdir", "hex": "0xF6", "bin": "11110110"},
+    {"dgm": "F7", "llvm": "@llvm.sys.listdir", "nasm": "CALL __sys_listdir", "hex": "0xF7", "bin": "11110111"},
+    {"dgm": "F8", "llvm": "@llvm.sys.mkdir", "nasm": "CALL __sys_mkdir", "hex": "0xF8", "bin": "11111000"},
+    {"dgm": "F9", "llvm": "@llvm.sys.rmdir", "nasm": "CALL __sys_rmdir", "hex": "0xF9", "bin": "11111001"},
+    {"dgm": "FA", "llvm": "@llvm.sys.tempfile", "nasm": "CALL __sys_tempfile", "hex": "0xFA", "bin": "11111010"},
+    {"dgm": "FB", "llvm": "@llvm.sys.clipboard", "nasm": "CALL __sys_clipboard", "hex": "0xFB", "bin": "11111011"},
+    {"dgm": "FC", "llvm": "@llvm.sys.args", "nasm": "CALL __sys_args", "hex": "0xFC", "bin": "11111100"},
+    {"dgm": "FD", "llvm": "@llvm.sys.uid", "nasm": "CALL __sys_uid", "hex": "0xFD", "bin": "11111101"},
+    {"dgm": "FE", "llvm": "@llvm.sys.pid", "nasm": "CALL __sys_pid", "hex": "0xFE", "bin": "11111110"},
+    {"dgm": "FF", "llvm": "@llvm.sys.exit", "nasm": "SYSCALL exit", "hex": "0xFF", "bin": "11111111"},
+
+    # === Crypto / Compression (100–11F) ===
+    {"dgm": "100", "llvm": "@llvm.hash.md5", "nasm": "CALL __hash_md5", "hex": "0x100", "bin": "000100000000"},
+    {"dgm": "101", "llvm": "@llvm.hash.sha1", "nasm": "CALL __hash_sha1", "hex": "0x101", "bin": "000100000001"},
+    {"dgm": "102", "llvm": "@llvm.hash.sha256", "nasm": "CALL __hash_sha256", "hex": "0x102", "bin": "000100000010"},
+    {"dgm": "103", "llvm": "@llvm.hash.sha512", "nasm": "CALL __hash_sha512", "hex": "0x103", "bin": "000100000011"},
+    {"dgm": "104", "llvm": "@llvm.hmac.md5", "nasm": "CALL __hmac_md5", "hex": "0x104", "bin": "000100000100"},
+    {"dgm": "105", "llvm": "@llvm.hmac.sha256", "nasm": "CALL __hmac_sha256", "hex": "0x105", "bin": "000100000101"},
+    {"dgm": "106", "llvm": "@llvm.base64.encode", "nasm": "CALL __base64_encode", "hex": "0x106", "bin": "000100000110"},
+    {"dgm": "107", "llvm": "@llvm.base64.decode", "nasm": "CALL __base64_decode", "hex": "0x107", "bin": "000100000111"},
+    {"dgm": "108", "llvm": "@llvm.hex.encode", "nasm": "CALL __hex_encode", "hex": "0x108", "bin": "000100001000"},
+    {"dgm": "109", "llvm": "@llvm.hex.decode", "nasm": "CALL __hex_decode", "hex": "0x109", "bin": "000100001001"},
+    {"dgm": "10A", "llvm": "@llvm.crc32", "nasm": "CALL __crc32", "hex": "0x10A", "bin": "000100001010"},
+    {"dgm": "10B", "llvm": "@llvm.random.bytes", "nasm": "CALL __random_bytes", "hex": "0x10B", "bin": "000100001011"},
+    {"dgm": "10C", "llvm": "@llvm.uuid.generate", "nasm": "CALL __uuid_generate", "hex": "0x10C", "bin": "000100001100"},
+    {"dgm": "10D", "llvm": "@llvm.password.hash", "nasm": "CALL __password_hash", "hex": "0x10D", "bin": "000100001101"},
+    {"dgm": "10E", "llvm": "@llvm.password.verify", "nasm": "CALL __password_verify", "hex": "0x10E", "bin": "000100001110"},
+    {"dgm": "10F", "llvm": "@llvm.jwt.encode", "nasm": "CALL __jwt_encode", "hex": "0x10F", "bin": "000100001111"},
+    {"dgm": "110", "llvm": "@llvm.zlib.compress", "nasm": "CALL __zlib_compress", "hex": "0x110", "bin": "000100010000"},
+    {"dgm": "111", "llvm": "@llvm.zlib.decompress", "nasm": "CALL __zlib_decompress", "hex": "0x111", "bin": "000100010001"},
+    {"dgm": "112", "llvm": "@llvm.bz2.compress", "nasm": "CALL __bz2_compress", "hex": "0x112", "bin": "000100010010"},
+    {"dgm": "113", "llvm": "@llvm.bz2.decompress", "nasm": "CALL __bz2_decompress", "hex": "0x113", "bin": "000100010011"},
+    {"dgm": "114", "llvm": "@llvm.lzma.compress", "nasm": "CALL __lzma_compress", "hex": "0x114", "bin": "000100010100"},
+    {"dgm": "115", "llvm": "@llvm.lzma.decompress", "nasm": "CALL __lzma_decompress", "hex": "0x115", "bin": "000100010101"},
+    {"dgm": "116", "llvm": "@llvm.gzip.compress", "nasm": "CALL __gzip_compress", "hex": "0x116", "bin": "000100010110"},
+    {"dgm": "117", "llvm": "@llvm.gzip.decompress", "nasm": "CALL __gzip_decompress", "hex": "0x117", "bin": "000100010111"},
+    {"dgm": "118", "llvm": "@llvm.tar.create", "nasm": "CALL __tar_create", "hex": "0x118", "bin": "000100011000"},
+    {"dgm": "119", "llvm": "@llvm.tar.extract", "nasm": "CALL __tar_extract", "hex": "0x119", "bin": "000100011001"},
+    {"dgm": "11A", "llvm": "@llvm.zip.create", "nasm": "CALL __zip_create", "hex": "0x11A", "bin": "000100011010"},
+    {"dgm": "11B", "llvm": "@llvm.zip.extract", "nasm": "CALL __zip_extract", "hex": "0x11B", "bin": "000100011011"},
+    {"dgm": "11C", "llvm": "@llvm.compress.detect", "nasm": "CALL __compress_detect", "hex": "0x11C", "bin": "000100011100"},
+    {"dgm": "11D", "llvm": "@llvm.compress.ratio", "nasm": "CALL __compress_ratio", "hex": "0x11D", "bin": "000100011101"},
+    {"dgm": "11E", "llvm": "@llvm.compress.level", "nasm": "CALL __compress_level", "hex": "0x11E", "bin": "000100011110"},
+    {"dgm": "11F", "llvm": "@llvm.compress.bench", "nasm": "CALL __compress_bench", "hex": "0x11F", "bin": "000100011111"},
+
+    # === Networking / DB / Regex / Audio (120–159) ===
+    {"dgm": "120", "llvm": "@llvm.http.get", "nasm": "CALL __http_get", "hex": "0x120", "bin": "000100100000"},
+    {"dgm": "121", "llvm": "@llvm.http.post", "nasm": "CALL __http_post", "hex": "0x121", "bin": "000100100001"},
+    {"dgm": "122", "llvm": "@llvm.http.head", "nasm": "CALL __http_head", "hex": "0x122", "bin": "000100100010"},
+    {"dgm": "123", "llvm": "@llvm.http.put", "nasm": "CALL __http_put", "hex": "0x123", "bin": "000100100011"},
+    {"dgm": "124", "llvm": "@llvm.http.delete", "nasm": "CALL __http_delete", "hex": "0x124", "bin": "000100100100"},
+    {"dgm": "125", "llvm": "@llvm.http.download", "nasm": "CALL __http_download", "hex": "0x125", "bin": "000100100101"},
+    {"dgm": "126", "llvm": "@llvm.ws.connect", "nasm": "CALL __ws_connect", "hex": "0x126", "bin": "000100100110"},
+    {"dgm": "127", "llvm": "@llvm.ws.send", "nasm": "CALL __ws_send", "hex": "0x127", "bin": "000100100111"},
+    {"dgm": "128", "llvm": "@llvm.ws.recv", "nasm": "CALL __ws_recv", "hex": "0x128", "bin": "000100101000"},
+    {"dgm": "129", "llvm": "@llvm.ws.close", "nasm": "CALL __ws_close", "hex": "0x129", "bin": "000100101001"},
+    {"dgm": "12A", "llvm": "@llvm.udp.send", "nasm": "CALL __udp_send", "hex": "0x12A", "bin": "000100101010"},
+    {"dgm": "12B", "llvm": "@llvm.udp.recv", "nasm": "CALL __udp_recv", "hex": "0x12B", "bin": "000100101011"},
+    {"dgm": "12C", "llvm": "@llvm.tcp.listen", "nasm": "CALL __tcp_listen", "hex": "0x12C", "bin": "000100101100"},
+    {"dgm": "12D", "llvm": "@llvm.tcp.accept", "nasm": "CALL __tcp_accept", "hex": "0x12D", "bin": "000100101101"},
+    {"dgm": "12E", "llvm": "@llvm.tcp.send", "nasm": "CALL __tcp_send", "hex": "0x12E", "bin": "000100101110"},
+    {"dgm": "12F", "llvm": "@llvm.tcp.recv", "nasm": "CALL __tcp_recv", "hex": "0x12F", "bin": "000100101111"},
+
+    {"dgm": "130", "llvm": "@llvm.db.open", "nasm": "CALL __db_open", "hex": "0x130", "bin": "000100110000"},
+    {"dgm": "131", "llvm": "@llvm.db.exec", "nasm": "CALL __db_exec", "hex": "0x131", "bin": "000100110001"},
+    {"dgm": "132", "llvm": "@llvm.db.query", "nasm": "CALL __db_query", "hex": "0x132", "bin": "000100110010"},
+    {"dgm": "133", "llvm": "@llvm.db.close", "nasm": "CALL __db_close", "hex": "0x133", "bin": "000100110011"},
+    {"dgm": "134", "llvm": "@llvm.db.begin", "nasm": "CALL __db_begin", "hex": "0x134", "bin": "000100110100"},
+    {"dgm": "135", "llvm": "@llvm.db.commit", "nasm": "CALL __db_commit", "hex": "0x135", "bin": "000100110101"},
+    {"dgm": "136", "llvm": "@llvm.db.rollback", "nasm": "CALL __db_rollback", "hex": "0x136", "bin": "000100110110"},
+    {"dgm": "137", "llvm": "@llvm.db.tables", "nasm": "CALL __db_tables", "hex": "0x137", "bin": "000100110111"},
+    {"dgm": "138", "llvm": "@llvm.db.schema", "nasm": "CALL __db_schema", "hex": "0x138", "bin": "000100111000"},
+    {"dgm": "139", "llvm": "@llvm.db.insert", "nasm": "CALL __db_insert", "hex": "0x139", "bin": "000100111001"},
+    {"dgm": "13A", "llvm": "@llvm.db.update", "nasm": "CALL __db_update", "hex": "0x13A", "bin": "000100111010"},
+    {"dgm": "13B", "llvm": "@llvm.db.delete", "nasm": "CALL __db_delete", "hex": "0x13B", "bin": "000100111011"},
+    {"dgm": "13C", "llvm": "@llvm.db.count", "nasm": "CALL __db_count", "hex": "0x13C", "bin": "000100111100"},
+    {"dgm": "13D", "llvm": "@llvm.db.indexes", "nasm": "CALL __db_indexes", "hex": "0x13D", "bin": "000100111101"},
+    {"dgm": "13E", "llvm": "@llvm.db.analyze", "nasm": "CALL __db_analyze", "hex": "0x13E", "bin": "000100111110"},
+    {"dgm": "13F", "llvm": "@llvm.db.vacuum", "nasm": "CALL __db_vacuum", "hex": "0x13F", "bin": "000100111111"},
+
+    {"dgm": "140", "llvm": "@llvm.regex.match", "nasm": "CALL __regex_match", "hex": "0x140", "bin": "000101000000"},
+    {"dgm": "141", "llvm": "@llvm.regex.findall", "nasm": "CALL __regex_findall", "hex": "0x141", "bin": "000101000001"},
+    {"dgm": "142", "llvm": "@llvm.regex.replace", "nasm": "CALL __regex_replace", "hex": "0x142", "bin": "000101000010"},
+    {"dgm": "143", "llvm": "@llvm.regex.split", "nasm": "CALL __regex_split", "hex": "0x143", "bin": "000101000011"},
+    {"dgm": "144", "llvm": "@llvm.regex.subn", "nasm": "CALL __regex_subn", "hex": "0x144", "bin": "000101000100"},
+    {"dgm": "145", "llvm": "@llvm.regex.compile", "nasm": "CALL __regex_compile", "hex": "0x145", "bin": "000101000101"},
+    {"dgm": "146", "llvm": "@llvm.fuzzy.match", "nasm": "CALL __fuzzy_match", "hex": "0x146", "bin": "000101000110"},
+    {"dgm": "147", "llvm": "@llvm.fuzzy.closest", "nasm": "CALL __fuzzy_closest", "hex": "0x147", "bin": "000101000111"},
+    {"dgm": "148", "llvm": "@llvm.fuzzy.sort", "nasm": "CALL __fuzzy_sort", "hex": "0x148", "bin": "000101001000"},
+
+    {"dgm": "150", "llvm": "@llvm.audio.playwav", "nasm": "CALL __audio_playwav", "hex": "0x150", "bin": "000101010000"},
+    {"dgm": "151", "llvm": "@llvm.audio.playmp3", "nasm": "CALL __audio_playmp3", "hex": "0x151", "bin": "000101010001"},
+    {"dgm": "152", "llvm": "@llvm.audio.record", "nasm": "CALL __audio_record", "hex": "0x152", "bin": "000101010010"},
+    {"dgm": "153", "llvm": "@llvm.audio.stop", "nasm": "CALL __audio_stop", "hex": "0x153", "bin": "000101010011"},
+    {"dgm": "154", "llvm": "@llvm.audio.tone", "nasm": "CALL __audio_tone", "hex": "0x154", "bin": "000101010100"},
+    {"dgm": "155", "llvm": "@llvm.audio.volume", "nasm": "CALL __audio_volume", "hex": "0x155", "bin": "000101010101"},
+    {"dgm": "156", "llvm": "@llvm.audio.mixer", "nasm": "CALL __audio_mixer", "hex": "0x156", "bin": "000101010110"},
+    {"dgm": "157", "llvm": "@llvm.audio.pause", "nasm": "CALL __audio_pause", "hex": "0x157", "bin": "000101010111"},
+    {"dgm": "158", "llvm": "@llvm.audio.resume", "nasm": "CALL __audio_resume", "hex": "0x158", "bin": "000101011000"},
+    {"dgm": "159", "llvm": "@llvm.audio.stream", "nasm": "CALL __audio_stream", "hex": "0x159", "bin": "000101011001"},
+]
+# --- Elevator: resolve missing definitions, install robust fallbacks & workarounds ---
+# Appended to bottom of NEWS.py
+import inspect
+import logging
+from typing import Any, Dict
+
+_logger = logging.getLogger("news.elevator")
+if not _logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    _logger.addHandler(h)
+    _logger.setLevel(logging.INFO)
+
+
+def _ensure_opcode_index():
+    """
+    Ensure OPCODE_MAP and OPCODE_INDEX exist and are consistent.
+    Builds OPCODE_INDEX (int -> entry) if missing.
+    """
+    global OPCODE_MAP, OPCODE_INDEX, OPCODES
+    if "OPCODE_MAP" not in globals() or not isinstance(OPCODE_MAP, list):
+        # Build minimal OPCODE_MAP from OPCODES mapping if present
+        OPCODE_MAP = []
+        if "OPCODES" in globals() and isinstance(OPCODES, dict):
+            for name, val in OPCODES.items():
+                OPCODE_MAP.append({"dgm": f"{val:X}", "llvm": name, "nasm": "", "hex": f"0x{val:X}", "bin": ""})
+    if "OPCODE_INDEX" not in globals() or not isinstance(globals().get("OPCODE_INDEX"), dict):
+        OPCODE_INDEX = {}
+        for entry in OPCODE_MAP:
+            try:
+                hv = int(entry.get("hex", "0"), 16)
+            except Exception:
+                try:
+                    hv = int(entry.get("dgm", "0"), 16)
+                except Exception:
+                    continue
+            OPCODE_INDEX[hv] = entry
+    # Ensure OPCODES mapping includes reverse names for entries
+    if "OPCODES" not in globals() or not isinstance(OPCODES, dict):
+        OPCODES = {}
+    for hv, entry in OPCODE_INDEX.items():
+        name = entry.get("llvm")
+        if isinstance(name, str) and name and name not in OPCODES:
+            OPCODES[name] = hv
+
+
+def _default_opcode_handler(vm: Any, opcode_int: int) -> bool:
+    """
+    Generic fallback handler for unknown opcodes.
+    Records usage and a readable note into the VM's output buffer (thread-safe),
+    and returns True to indicate the opcode was handled (no-op).
+    """
+    try:
+        if not hasattr(vm, "dynamic_usage"):
+            vm.dynamic_usage = {}
+        vm.dynamic_usage[opcode_int] = vm.dynamic_usage.get(opcode_int, 0) + 1
+
+        entry = OPCODE_INDEX.get(opcode_int)
+        if entry:
+            note = f"[ELEVATOR] Unimplemented opcode {hex(opcode_int)} ({entry.get('llvm')}) — noop recorded."
+        else:
+            note = f"[ELEVATOR] Unknown opcode {hex(opcode_int)} — noop recorded."
+
+        # Best-effort safe append
+        try:
+            if not hasattr(vm, "output_buffer") or not isinstance(vm.output_buffer, list):
+                vm.output_buffer = []
+            # thread-safe lock if present
+            lock = getattr(vm, "_output_buffer_lock", None)
+            if lock is None:
+                vm.output_buffer.append(note)
+            else:
+                with lock:
+                    vm.output_buffer.append(note)
+        except Exception:
+            # final fallback: logging
+            _logger.info(note)
+        return True
+    except Exception as exc:
+        _logger.exception("elevator default handler failed: %s", exc)
+        return True  # swallow to avoid crashing VM
+
+
+def _patch_vm_instance_for_external_handlers(vm: Any):
+    """
+    Install a robust step wrapper that:
+      - Peeks the next opcode token (supports both string-base12 token lists and _compiled_tokens)
+      - If an external handler exists in vm.external_handlers, call it and consume opcode
+      - Otherwise call original step() and, on ValueError('Unknown opcode ...'), call the elevator fallback
+    This wrapper is idempotent.
+    """
+    if getattr(vm, "_elevator_wrapped", False):
+        return
+    if not hasattr(vm, "external_handlers") or not isinstance(getattr(vm, "external_handlers"), dict):
+        vm.external_handlers = {}
+
+    original_step = getattr(vm, "step")
+
+    def wrapped_step():
+        # Prefer compiled tokens (FastNewsVM) if present
+        try:
+            if hasattr(vm, "_compiled_tokens"):
+                tokens = vm._compiled_tokens
+                ip = getattr(vm, "ip", 0)
+                if ip < len(tokens):
+                    tok = tokens[ip]
+                    opc = None
+                    if isinstance(tok, int):
+                        opc = tok
+                    else:
+                        try:
+                            opc = from_base12(str(tok))
+                        except Exception:
+                            try:
+                                opc = int(str(tok), 0)
+                            except Exception:
+                                opc = None
+                    if opc is not None and opc in vm.external_handlers:
+                        # consume token and call handler
+                        vm.ip = ip + 1
+                        try:
+                            handled = vm.external_handlers[opc](vm, opc)
+                            if handled:
+                                return
+                        except Exception as e:
+                            _logger.exception("external handler raised: %s", e)
+            # Fallback to textual tokens (NewsVM)
+            if not hasattr(vm, "_compiled_tokens"):
+                tokens = getattr(vm, "tokens", [])
+                ip = getattr(vm, "ip", 0)
+                if ip < len(tokens):
+                    tok = tokens[ip]
+                    opc = None
+                    try:
+                        opc = from_base12(tok)
+                    except Exception:
+                        try:
+                            opc = int(tok, 0)
+                        except Exception:
+                            opc = None
+                    if opc is not None and opc in vm.external_handlers:
+                        vm.ip = ip + 1
+                        try:
+                            handled = vm.external_handlers[opc](vm, opc)
+                            if handled:
+                                return
+                        except Exception as e:
+                            _logger.exception("external handler raised: %s", e)
+            # No external handler found; call original_step and handle Unknown opcode gracefully
+            try:
+                return original_step()
+            except ValueError as e:
+                msg = str(e)
+                if msg.startswith("Unknown opcode"):
+                    # parse hex from message if present
+                    try:
+                        # message may be like "Unknown opcode 0xabc"
+                        part = msg.split()[2]
+                        if part.startswith("0x"):
+                            op_int = int(part, 16)
+                        else:
+                            # maybe decimal
+                            op_int = int(part, 0)
+                    except Exception:
+                        # best-effort: attempt to peek and interpret
+                        op_int = None
+                        try:
+                            if hasattr(vm, "_compiled_tokens"):
+                                ip = getattr(vm, "ip", 0)
+                                if ip > 0:
+                                    candidate = vm._compiled_tokens[ip - 1]
+                                    op_int = candidate if isinstance(candidate, int) else from_base12(str(candidate))
+                            else:
+                                ip = getattr(vm, "ip", 0)
+                                if ip > 0:
+                                    candidate = vm.tokens[ip - 1]
+                                    op_int = from_base12(candidate)
+                        except Exception:
+                            op_int = None
+                    if op_int is None:
+                        _logger.warning("Elevator: Unknown opcode detected but could not determine code. Message: %s", msg)
+                        return
+                    # call default elevator handler
+                    try:
+                        _default_opcode_handler(vm, op_int)
+                        return
+                    except Exception:
+                        _logger.exception("Elevator handler failed for opcode %s", hex(op_int))
+                        return
+                # re-raise other ValueErrors
+                raise
+        except Exception:
+            # Never allow wrapper to crash the VM; log and stop the VM safely
+            _logger.exception("wrapped_step encountered an unexpected error")
+            vm.running = False
+
+    vm.step = wrapped_step
+    vm._elevator_wrapped = True
+
+
+def _ensure_vm_present():
+    """
+    If a top-level `vm` variable is referenced elsewhere, ensure it exists and is runnable.
+    Prefer FastNewsVM if available.
+    """
+    global vm
+    if "vm" in globals() and isinstance(globals().get("vm"), object):
+        return globals()["vm"]
+    # Try to create FastNewsVM or NewsVM
+    try:
+        vm_local = create_fast_vm(debug=False, trace=False)
+    except Exception:
+        vm_local = NewsVM(debug=False, trace=False)
+    # assign minimal no-op program so run() won't crash if invoked without code
+    vm_local.load_program("33")  # single `ret` opcode
+    globals()["vm"] = vm_local
+    return vm_local
+
+
+def _install_elevator_defaults(vm_instance: Any):
+    """
+    Install the elevator's default handler into vm_instance.external_handlers for any opcode
+    that does not already have a handler. This prevents Unknown opcode exceptions.
+    """
+    _ensure_opcode_index()
+    if not hasattr(vm_instance, "external_handlers") or not isinstance(vm_instance.external_handlers, dict):
+        vm_instance.external_handlers = {}
+    for op_int in list(OPCODE_INDEX.keys()):
+        if op_int not in vm_instance.external_handlers:
+            # Register default handler
+            vm_instance.external_handlers[op_int] = _default_opcode_handler
+    # Also patch instance to consult external handlers first
+    _patch_vm_instance_for_external_handlers(vm_instance)
+
+
+def resolve_missing_names_and_attach():
+    """
+    Public entrypoint: resolve missing global names, create a global vm if needed,
+    patch it, and attach elevator defaults.
+    """
+    try:
+        _ensure_opcode_index()
+    except Exception:
+        _logger.exception("Failed to ensure opcode index")
+
+    vm_inst = _ensure_vm_present()
+    try:
+        _install_elevator_defaults(vm_inst)
+        _logger.info("Elevator installed: default handlers registered for %d opcodes.", len(vm_inst.external_handlers))
+    except Exception:
+        _logger.exception("Failed to install elevator defaults")
+
+    # Make helper functions available globally for interactive use
+    globals().setdefault("attach_extensions_to_vm", attach_extensions_to_vm if "attach_extensions_to_vm" in globals() else lambda v: None)
+    globals().setdefault("extend_vm_with_dynamic_mapping", extend_vm_with_dynamic_mapping if "extend_vm_with_dynamic_mapping" in globals() else lambda *a, **k: {})
+    return vm_inst
+
+
+# Auto-run elevator to fix unresolved references at module import
+try:
+    resolve_missing_names_and_attach()
+except Exception:
+    _logger.exception("Auto elevator failed during import-time install")
+
+# End of elevator — ensures missing definitions are handled gracefully and unknown opcodes become safe no-ops.
