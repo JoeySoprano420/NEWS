@@ -195,3 +195,215 @@ string_escape ::= "\\" ( "\"" | "'" | "n" | "r" | "t" | "\\" ) ;
      default => { print("many"); }
    }
 *)
+
+(* NEWS DGM Bytecode — Expanded EBNF
+   - Comprehensive, self-describing bytecode format suited for the NEWS language.
+   - Human-friendly textual base-12 representation is used for tokens; binary layout can be derived from it.
+   - Sections, relocations, symbol table, constants pool, debug info, control-flow labels,
+     alignment, checksums, and extensible metadata are supported. *)
+
+(* --- Lexical tokens --- *)
+base12_digit   ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "a" | "b" ;
+base12_nibble  ::= base12_digit ;
+base12_number  ::= base12_digit { base12_digit } ;        (* digits represent a base-12 integer *)
+hex_digit      ::= "0".."9" | "A".."F" | "a".."f" ;
+IDENT          ::= letter { letter | digit | "_" } ;
+letter         ::= "A".."Z" | "a".."z" | "_" ;
+digit          ::= "0".."9" ;
+
+STRING_LITERAL ::= '"' { any_char_except_quote_or_backslash | escape } '"' ;
+escape         ::= "\" ( "\"" | "'" | "\" | "n" | "r" | "t" | "x" hex_digit hex_digit ) ;
+
+WS             ::= { " " | "\t" | NEWLINE } ;
+NEWLINE        ::= "\r\n" | "\n" | "\r" ;
+
+COMMENT        ::= "#" { any_char_except_newline } NEWLINE ;
+
+(* --- Top-level file layout --- *)
+file           ::= prelude header section_list footer ;
+
+prelude        ::= ( "DGM" ) ":" version_spec "/" architecture_spec NEWLINE ;
+version_spec   ::= base12_number ;            (* semantic version as base-12 major.minor.patch optional *)
+architecture_spec ::= IDENT ;                 (* e.g. "x86_64", "wasm", "native" *)
+
+header         ::= "HEADER" "{" header_entries "}" NEWLINE ;
+header_entries ::= header_entry { header_entry } ;
+header_entry   ::= "entry_point" ":" label_ref NEWLINE
+                 | "checksum" ":" hex_number NEWLINE
+                 | "flags" ":" flag_list NEWLINE
+                 | "metadata" ":" meta_block NEWLINE
+                 ;
+
+flag_list      ::= flag { "," flag } ;
+flag           ::= IDENT ;
+
+meta_block     ::= "{" { meta_entry NEWLINE } "}" ;
+meta_entry     ::= IDENT ":" STRING_LITERAL ;
+
+section_list   ::= { section } ;
+
+section        ::= section_header section_body ;
+section_header ::= "SECTION" ":" section_name ":" base12_number ":" base12_number NEWLINE ;
+                 (* SECTION : <name> : <offset_base12> : <length_base12> *)
+section_name   ::= "CODE" | "CONST" | "DATA" | "SYMTAB" | "RELOC" | "DEBUG" | IDENT ;
+
+section_body   ::= "{" { section_item } "}" NEWLINE ;
+
+section_item   ::= instruction_line
+                 | constant_entry
+                 | data_entry
+                 | sym_entry
+                 | reloc_entry
+                 | debug_entry
+                 | raw_blob
+                 ;
+
+raw_blob       ::= "RAW" ":" base12_number ":" base12_sequence NEWLINE ;
+raw_blob_len   ::= base12_number ; (* length in base-12 units *)
+raw_blob_seq   ::= base12_sequence ;
+
+base12_sequence ::= base12_number { " " base12_number } ;
+
+(* --- Constants pool --- *)
+constant_entry ::= "CONST" ":" const_id ":" const_type ":" const_value NEWLINE ;
+const_id       ::= IDENT ;
+const_type     ::= "int" | "str" | "bytes" | "float" | "tuple" | "list" | IDENT ;
+const_value    ::= base12_number | STRING_LITERAL | "[" base12_sequence "]" ;
+
+(* --- Data section entries --- *)
+data_entry     ::= "DATA" ":" data_id ":" data_len ":" base12_sequence NEWLINE ;
+data_id        ::= IDENT ;
+data_len       ::= base12_number ;
+
+(* --- Symbol table --- *)
+sym_entry      ::= "SYM" ":" sym_id ":" sym_kind ":" sym_value NEWLINE ;
+sym_id         ::= IDENT ;
+sym_kind       ::= "func" | "local" | "global" | "label" | "const" ;
+sym_value      ::= base12_number | label_ref | STRING_LITERAL ;
+
+label_ref      ::= ":" IDENT ;             (* textual label reference in code or symbol table *)
+
+(* --- Relocations --- *)
+reloc_entry    ::= "RELOC" ":" reloc_offset ":" reloc_type ":" reloc_target NEWLINE ;
+reloc_offset   ::= base12_number ;         (* offset within section *)
+reloc_type     ::= "ABS" | "REL" | "SYMBOL" | "PCREL" ;
+reloc_target   ::= label_ref | sym_id | base12_number ;
+
+(* --- Debug info --- *)
+debug_entry    ::= "DEBUG" ":" debug_kind ":" debug_payload NEWLINE ;
+debug_kind     ::= "LINE" | "SOURCE" | "VAR" | "FRAME" | IDENT ;
+debug_payload  ::= STRING_LITERAL | "[" debug_kv { "," debug_kv } "]" ;
+debug_kv       ::= IDENT ":" base12_number ;
+
+(* --- Footer / integrity --- *)
+footer         ::= "FOOTER" "{" footer_entries "}" NEWLINE ;
+footer_entries ::= footer_entry { footer_entry } ;
+footer_entry   ::= "checksum" ":" hex_number NEWLINE
+                 | "signature" ":" STRING_LITERAL NEWLINE
+                 | "end_marker" ":" "DGM-END" NEWLINE
+                 ;
+
+hex_number     ::= ( hex_digit ) { hex_digit } ;
+
+(* --- Instruction encoding (textual base-12 form) --- *)
+instruction_line ::= instruction_token { " " operand } NEWLINE ;
+instruction_token ::= opcode_name | base12_number ;  (* either symbolic opcode or raw numeric opcode in base-12 *)
+
+opcode_name    ::= IDENT ;                           (* e.g. "echo", "add", "br", "call" *)
+
+operand        ::= immediate
+                 | reg
+                 | label_ref
+                 | sym_ref
+                 | mem_ref
+                 | const_ref
+                 | type_tag
+                 | base12_number
+                 ;
+
+immediate      ::= "#" base12_number ;               (* immediate literal, base-12 *)
+reg            ::= "r" base12_number ;               (* register virtual index e.g. r1 *)
+mem_ref        ::= "[" base12_number ":" base12_number "]" ; (* [addr:len] *)
+sym_ref        ::= "$" sym_id ;
+const_ref      ::= "@" const_id ;
+type_tag       ::= "%" IDENT ;                       (* runtime type or class tag *)
+
+(* Standard operands shorthand *)
+label_operand  ::= ":" IDENT ;
+sym_operand    ::= "$" IDENT ;
+
+(* --- Instruction categories + operand patterns --- *)
+(* This section declares common instruction signatures to make parsing and validation easier.
+   Each opcode can appear symbolically (name) or numerically (base-12 code). *)
+instr_nop      ::= "nop" ;
+instr_echo     ::= "echo" immediate* "#" ;          (* echo <chars...> 0 terminator: in numeric form it's opcode char codes followed by 0 *)
+instr_load     ::= "load" reg mem_ref ;
+instr_store    ::= "store" reg mem_ref ;
+instr_add      ::= "add" reg reg|immediate ;
+instr_sub      ::= "sub" reg reg|immediate ;
+instr_mul      ::= "mul" reg reg|immediate ;
+instr_udiv     ::= "udiv" reg reg|immediate ;
+instr_icmp     ::= "icmp" reg reg comp_op ;
+instr_br       ::= "br" label_operand ;
+instr_br_cond  ::= "br_if" reg label_operand label_operand ; (* br_if <cond_reg> <then_label> <else_label> *)
+instr_call     ::= "call" sym_operand | label_operand ;
+instr_ret      ::= "ret" ;
+instr_alloca   ::= "alloca" reg base12_number ;
+instr_tuple_pack ::= "tuple.pack" reg base12_number ;
+instr_tuple_unpack ::= "tuple.unpack" reg ;
+instr_list_append ::= "list.append" reg reg ;
+instr_array_load ::= "array.load" reg reg ;
+instr_array_store ::= "array.store" reg reg reg ;
+instr_future   ::= "future" sym_operand | label_operand ;
+instr_parallel ::= "parallel" "(" { operand { "," operand } } ")" ;
+instr_sync     ::= "sync" ;
+instr_exit     ::= "exit" ;
+
+comp_op        ::= "==" | "!=" | "<" | ">" | "<=" | ">=" ;
+
+(* --- Label definitions inside CODE section --- *)
+label_def      ::= IDENT ":" NEWLINE ;              (* anchor for branches/relocs *)
+
+(* --- High-level code block --- *)
+code_block     ::= { ( label_def | instruction_line ) } ;
+
+(* --- Validation helpers (informal) --- *)
+(* - Each SECTION declares its declared length matching the number of base-12 tokens inside the body.
+   - CODE section is a sequence of label_def and instruction_line.
+   - SYMTAB entries map names to section offsets or labels.
+   - RELOC entries point to offsets and resolve at load time against SYMTAB.
+   - CONST section supplies pre-evaluated constants to use by loader/VM.
+   - DEBUG optionally maps source line numbers to code offsets. *)
+
+(* --- Example minimal DGM file (illustrative) --- *)
+(* 
+DGM:1/NEWS-x86
+HEADER {
+  entry_point: :main
+  checksum:  3f2a
+}
+SECTION:CONST:0:3 {
+  CONST:pi:int:1
+  CONST:greeting:str:"Hello"
+}
+SECTION:CODE:3:20 {
+main:
+  echo # "H" "i" # 0
+  call :print_num
+  ret
+print_num:
+  load r1 [1:1]
+  echo # "N" "u" "m" # 0
+  ret
+}
+FOOTER {
+  checksum:3f2a
+  end_marker:DGM-END
+}
+*)
+
+(* --- Notes for implementers ---
+   - Parsers may treat all base12_number tokens as numeric immediate values; mapping to binary bytes depends on desired wire format.
+   - The grammar is intentionally verbose to allow future extensions (new sections, instruction sets, compressed sections).
+   - For compact binary serialization, convert base-12 textual numbers into binary little-endian integers using a fixed unit width (e.g., 8-bit or 16-bit) chosen by header flags.
+*)
