@@ -305,7 +305,7 @@ if __name__ == "__main__":
             self.lists: Dict[int, List[Any]] = {}
             self.groups: Dict[int, List[Any]] = {}
             self.threads: List[threading.Thread] = []
-    
+
         # ---------------- Loader ----------------
         def load_program(self, code: str):
             self.tokens = code.strip().split()
@@ -816,4 +816,386 @@ def disassemble(dgm_code: str):
                     line += "  " + ", ".join(args)
                     print(line)
                     print("===================")
+
+# ============================================================
+# NEWS GRAND EXPANSION LAYER
+# ============================================================
+
+import math, random, socket, threading, queue, time, platform, os, json
+
+
+# -------------------------
+# Extended NEWS Library
+# -------------------------
+
+class NewsLib:
+    """A library of NEWS standard functions exposed via opcodes."""
+
+    def __init__(self, vm):
+        self.vm = vm
+
+    # ---- Math ----
+    def sqrt(self, x): return int(math.sqrt(x))
+    def sin(self, x): return math.sin(x)
+    def cos(self, x): return math.cos(x)
+    def rand(self, a, b): return random.randint(a, b)
+
+    # ---- Strings ----
+    def concat(self, a, b): return str(a) + str(b)
+    def upper(self, s): return str(s).upper()
+    def lower(self, s): return str(s).lower()
+    def strlen(self, s): return len(str(s))
+
+    # ---- File I/O ----
+    def writefile(self, path, data):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data)
+    def appendfile(self, path, data):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(data)
+    def readfile(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # ---- Networking ----
+    def tcp_server(self, host, port, handler):
+        def server_thread():
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind((host, port))
+            srv.listen(5)
+            while True:
+                conn, addr = srv.accept()
+                data = conn.recv(1024).decode()
+                conn.sendall(handler(data).encode())
+                conn.close()
+        t = threading.Thread(target=server_thread, daemon=True)
+        t.start()
+        return t
+
+    def tcp_client(self, host, port, msg):
+        cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        cli.connect((host, port))
+        cli.sendall(msg.encode())
+        data = cli.recv(1024).decode()
+        cli.close()
+        return data
+
+    # ---- System ----
+    def now(self): return time.time()
+    def sleep(self, s): time.sleep(s)
+    def getenv(self, key): return os.getenv(key, "")
+    def sysinfo(self): return platform.platform()
+
+# -------------------------
+# Extended REPL Commands
+# -------------------------
+
+def repl_meta(vm, t, dgm_code):
+    """Handle REPL meta-commands starting with ':'"""
+    cmd = dgm_code.strip()
+    if cmd == ":stack":
+        print("[STACK]", vm.stack)
+        return True
+    elif cmd == ":mem":
+        print("[MEMORY]", json.dumps(vm.memory, indent=2))
+        return True
+    elif cmd == ":dis":
+        disassemble(" ".join(vm.tokens))
+        return True
+    elif cmd == ":quit":
+        sys.exit(0)
+    return False
+
+
+
+# -------------------------
+# Extended VM Integration
+# -------------------------
+
+def expand_vm(vm: 'NewsVM'):
+    """Monkey-patch the VM with extended capabilities."""
+    vm.lib = NewsLib(vm)
+    
+
+    old_step = vm.step
+    def new_step():
+        opcode = vm.fetch()
+
+        # --- Extended Math ---
+        if opcode == 0xD0:  # math.sqrt
+            x = vm.stack.pop()
+            vm.stack.append(vm.lib.sqrt(x))
+
+        elif opcode == 0xD1:  # math.rand
+            b, a = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append(vm.lib.rand(a, b))
+
+        elif opcode == 0xD2:  # string.concat
+            b, a = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append(vm.lib.concat(a, b))
+
+        elif opcode == 0xD3:  # string.upper
+            s = vm.stack.pop()
+            vm.stack.append(vm.lib.upper(s))
+
+        elif opcode == 0xD4:  # string.lower
+            s = vm.stack.pop()
+            vm.stack.append(vm.lib.lower(s))
+
+        elif opcode == 0xD5:  # file.write
+            data, path = vm.stack.pop(), vm.stack.pop()
+            vm.lib.writefile(path, data)
+
+        elif opcode == 0xD6:  # file.read
+            path = vm.stack.pop()
+            vm.stack.append(vm.lib.readfile(path))
+
+        elif opcode == 0xD7:  # system.now
+            vm.stack.append(vm.lib.now())
+
+        elif opcode == 0xD8:  # system.sleep
+            s = vm.stack.pop()
+            vm.lib.sleep(s)
+
+        elif opcode == 0xD9:  # system.sysinfo
+            vm.stack.append(vm.lib.sysinfo())
+
+        # --- Extended Game ---
+        elif opcode == 0xE0:  # game.init
+            h, w = vm.stack.pop(), vm.stack.pop()
+            title = vm.stack.pop()
+            vm.game.init(w,h,title)
+
+        elif opcode == 0xE1:  # game.addEntity
+            color, h, w, y, x = vm.stack.pop(), vm.stack.pop(), vm.stack.pop(), vm.stack.pop(), vm.stack.pop()
+            vm.game.add_entity(x,y,w,h,tuple(color))
+
+        elif opcode == 0xE2:  # game.update
+            vm.game.update()
+
+        elif opcode == 0xE3:  # game.render
+            vm.game.render()
+
+        elif opcode == 0xE4:  # game.running
+            vm.stack.append(1 if vm.game.is_running() else 0)
+
+        elif opcode == 0xE5:  # game.quit
+            vm.game.quit()
+
+        else:
+            return old_step()  # fallback to original VM
+
+    vm.step = new_step
+
+# Call this at startup
+expand_vm  # function defined, call in main() before run
+
+# ============================================================
+# IMMENSE OPCODE EXPANSION (Beyond 0xF0)
+# ============================================================
+
+import hashlib, base64, sqlite3, bz2, lzma, gzip, re, difflib
+import wave
+
+def expand_vm_more(vm: 'NewsVM'):
+    old_step = vm.step
+    def new_step():
+        opcode = vm.fetch()
+
+        # --- Advanced Math (0xF0–0xFF) ---
+        if opcode == 0xF0:  # math.pow
+            b,a = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append(int(math.pow(a,b)))
+
+        elif opcode == 0xF1:  # math.log
+            x = vm.stack.pop()
+            vm.stack.append(math.log(x))
+
+        elif opcode == 0xF2:  # math.sin
+            x = vm.stack.pop()
+            vm.stack.append(math.sin(x))
+
+        elif opcode == 0xF3:  # math.cos
+            x = vm.stack.pop()
+            vm.stack.append(math.cos(x))
+
+        elif opcode == 0xF4:  # math.tan
+            x = vm.stack.pop()
+            vm.stack.append(math.tan(x))
+
+        elif opcode == 0xF5:  # vector.add
+            b, a = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append([x+y for x,y in zip(a,b)])
+
+        elif opcode == 0xF6:  # vector.dot
+            b, a = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append(sum(x*y for x,y in zip(a,b)))
+
+        elif opcode == 0xF7:  # vector.cross
+            b, a = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append([
+                a[1]*b[2]-a[2]*b[1],
+                a[2]*b[0]-a[0]*b[2],
+                a[0]*b[1]-a[1]*b[0]
+            ])
+
+        # --- Crypto & Hashing (0x100–0x10F) ---
+        elif opcode == 0x100:  # hash.sha256
+            s = str(vm.stack.pop()).encode()
+            vm.stack.append(hashlib.sha256(s).hexdigest())
+
+        elif opcode == 0x101:  # hash.md5
+            s = str(vm.stack.pop()).encode()
+            vm.stack.append(hashlib.md5(s).hexdigest())
+
+        elif opcode == 0x102:  # base64.encode
+            s = str(vm.stack.pop()).encode()
+            vm.stack.append(base64.b64encode(s).decode())
+
+        elif opcode == 0x103:  # base64.decode
+            s = str(vm.stack.pop()).encode()
+            vm.stack.append(base64.b64decode(s).decode())
+
+        # --- Compression (0x110–0x11F) ---
+        elif opcode == 0x110:  # zlib.compress
+            s = str(vm.stack.pop()).encode()
+            vm.stack.append(zlib.compress(s))
+
+        elif opcode == 0x111:  # zlib.decompress
+            data = vm.stack.pop()
+            vm.stack.append(zlib.decompress(data).decode())
+
+        elif opcode == 0x112:  # bz2.compress
+            s = str(vm.stack.pop()).encode()
+            vm.stack.append(bz2.compress(s))
+
+        elif opcode == 0x113:  # bz2.decompress
+            data = vm.stack.pop()
+            vm.stack.append(bz2.decompress(data).decode())
+
+        elif opcode == 0x114:  # lzma.compress
+            s = str(vm.stack.pop()).encode()
+            vm.stack.append(lzma.compress(s))
+
+        elif opcode == 0x115:  # lzma.decompress
+            data = vm.stack.pop()
+            vm.stack.append(lzma.decompress(data).decode())
+
+               # --- Databases (0x130–0x13F) ---
+        elif opcode == 0x130:  # db.open
+            path = vm.stack.pop()
+            vm.db = sqlite3.connect(path)
+            vm.stack.append(1)
+
+        elif opcode == 0x131:  # db.exec
+            query = vm.stack.pop()
+            cur = vm.db.cursor()
+            cur.execute(query)
+            vm.db.commit()
+            vm.stack.append(1)
+
+        elif opcode == 0x132:  # db.query
+            query = vm.stack.pop()
+            cur = vm.db.cursor()
+            cur.execute(query)
+            rows = cur.fetchall()
+            vm.stack.append(rows)
+
+        elif opcode == 0x133:  # db.close
+            vm.db.close()
+            vm.stack.append(1)
+
+        # --- Regex & Fuzzy (0x140–0x14F) ---
+        elif opcode == 0x140:  # regex.match
+            pat, s = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append(bool(re.match(pat,s)))
+
+        elif opcode == 0x141:  # regex.findall
+            pat, s = vm.stack.pop(), vm.stack.pop()
+            vm.stack.append(re.findall(pat,s))
+
+        elif opcode == 0x142:  # fuzzy.match
+            a, b = vm.stack.pop(), vm.stack.pop()
+            ratio = difflib.SequenceMatcher(None,a,b).ratio()
+            vm.stack.append(ratio)
+          
+        else:
+            return old_step()
+    vm.step = new_step
+
+# Add this near the other standard compression/crypto imports (e.g. with bz2, lzma, gzip)
+import zlib
+
+import hashlib, base64, sqlite3, bz2, lzma, gzip, re, difflib
+
+"import zlib; print('zlib OK', hasattr(zlib,'compress'))"
+
+"""
+env_definitions.py
+------------------
+Meta-definitions of Python, PyAudio, Pygame, Requests, and C —
+inside Python itself.
+"""
+
+import sys, os, platform, math, random
+# ============================================================
+# Base Environment Class
+# ============================================================
+
+class Environment:
+    name = "Generic"
+    version = "0.0"
+    features = []
+    example_code = ""
+
+    @classmethod
+    def describe(cls):
+        print(f"=== {cls.name} v{cls.version} ===")
+        print("Features:")
+        for f in cls.features:
+            print(" -", f)
+        if cls.example_code:
+            print("\nExample:\n", cls.example_code)
+
+# ============================================================
+# Python Definition
+# ============================================================
+
+class PythonEnv(Environment):
+    name = "Python"
+    version = platform.python_version()
+    features = [
+        "Dynamic, high-level programming language",
+        "Object-oriented, functional, and procedural paradigms",
+        "Vast standard library (math, sys, os, threading, etc.)",
+        "Cross-platform interpreter",
+        "Extensive ecosystem of packages (PyPI)"
+    ]
+    example_code = """\
+def greet(name):
+    return f"Hello, {name}!"
+print(greet("World"))
+"""
+
+# ============================================================
+# C Language Definition
+# ============================================================
+
+class CEnv(Environment):
+    name = "C"
+    version = "ISO C17 (2018)"  # meta version
+    features = [
+        "Procedural, low-level programming language",
+        "Portable systems language (compilers everywhere)",
+        "Direct memory management via pointers",
+        "Basis for many OS kernels and runtimes",
+        "Compiled to machine code (via gcc/clang/MSVC)"
+    ]
+    example_code = """\
+#include <stdio.h>
+int main() {
+    printf("Hello, World!\\n");
+    return 0;
+}
+"""
 
