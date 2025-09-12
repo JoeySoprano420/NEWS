@@ -616,3 +616,160 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def disassemble(dgm_code: str):
+    tokens = dgm_code.split()
+    i = 0
+    print("=== DISASSEMBLY ===")
+    while i < len(tokens):
+        t = tokens[i]; i += 1
+        try:
+            op = from_base12(t)
+        except ValueError:
+            print(f"{t:<4}  [NON-NUMERIC TOKEN?]")
+            continue
+
+        # lookup opcode name
+        opname = next((k for k,v in OPCODES.items() if v == op), f"UNKNOWN({t})")
+        line = f"{t:<4}  {opname}"
+
+        # ---------------- CORE OPS (00–4B) ----------------
+        if opname in ("store","add","sub","mul","udiv","sdiv"):
+            addr, val = tokens[i], tokens[i+1]; i+=2
+            line += f"  addr={from_base12(addr)} val={from_base12(val)}"
+
+        elif opname == "load":
+            addr = tokens[i]; i+=1
+            line += f"  addr={from_base12(addr)}"
+
+        elif opname == "icmp":
+            addr, num, opstr = tokens[i], tokens[i+1], tokens[i+2]; i+=3
+            line += f"  addr={from_base12(addr)} cmp {opstr} {from_base12(num)}"
+
+        elif opname == "br":
+            target = tokens[i]; i+=1
+            line += f"  target={from_base12(target)}"
+
+        elif opname == "echo":
+            chars = []
+            while i < len(tokens):
+                v = from_base12(tokens[i]); i+=1
+                if v == 0: break
+                chars.append(chr(v))
+            line += f'  "{''.join(chars)}"'
+
+        elif opname == "call":
+            target = tokens[i]; i+=1
+            line += f"  fn@{from_base12(target)}"
+
+        elif opname == "ret":
+            pass
+
+        # ---------------- SAFE OPS (50–7B) ----------------
+        elif opname.startswith("safe."):
+            addr, val = tokens[i], tokens[i+1]; i+=2
+            line += f"  addr={from_base12(addr)} val={from_base12(val)} (safe)"
+
+        elif opname.startswith("branch."):
+            target = tokens[i]; i+=1
+            line += f"  guarded→{from_base12(target)}"
+
+        elif opname == "language.assert":
+            addr = tokens[i]; i+=1
+            line += f"  assert mem[{from_base12(addr)}]"
+
+        # ---------------- DATA STRUCTURES (80–9B) ----------------
+        elif opname == "tuple.pack":
+            length = from_base12(tokens[i]); i+=1
+            vals = [from_base12(tokens[i+j]) for j in range(length)]
+            i+=length
+            line += f"  tuple({', '.join(map(str, vals))})"
+
+        elif opname == "tuple.unpack":
+            addr = tokens[i]; i+=1
+            line += f"  from tuple@{from_base12(addr)}"
+
+        elif opname in ("list.append","list.remove","list.insert","list.pop"):
+            addr, val = tokens[i], tokens[i+1]; i+=2
+            line += f"  list@{from_base12(addr)} ← {from_base12(val)}"
+
+        elif opname == "array.load":
+            addr, idx = tokens[i], tokens[i+1]; i+=2
+            line += f"  load arr@{from_base12(addr)}[{from_base12(idx)}]"
+
+        elif opname == "array.store":
+            addr, idx, val = tokens[i], tokens[i+1], tokens[i+2]; i+=3
+            line += f"  arr@{from_base12(addr)}[{from_base12(idx)}] = {from_base12(val)}"
+
+        elif opname.startswith("group."):
+            addr = tokens[i]; i+=1
+            line += f"  group op target={from_base12(addr)}"
+
+        elif opname in ("nest.enter","nest.exit","pair.create","pair.split"):
+            addr = tokens[i]; i+=1
+            line += f"  struct target={from_base12(addr)}"
+
+        elif opname == "match.begin":
+            addr = tokens[i]; i+=1
+            line += f"  match var@{from_base12(addr)}"
+
+        elif opname == "match.case":
+            val = tokens[i]; i+=1
+            line += f"  case {from_base12(val)}"
+
+        elif opname == "match.end":
+            pass
+
+        # ---------------- CIAM EXTENSIONS (A0–BB) ----------------
+        elif opname in ("inline","macro","trace"):
+            line += "  [compiler hint]"
+
+        elif opname == "link":
+            lib = tokens[i]; i+=1
+            line += f"  link {lib}"
+
+        elif opname == "delete":
+            addr = tokens[i]; i+=1
+            line += f"  free mem@{from_base12(addr)}"
+
+        elif opname == "open":
+            fname = []
+            while i < len(tokens):
+                v = from_base12(tokens[i]); i+=1
+                if v == 0: break
+                fname.append(chr(v))
+            line += f"  fopen('{''.join(fname)}')"
+
+        elif opname == "close":
+            fd = tokens[i]; i+=1
+            line += f"  fclose(fd={from_base12(fd)})"
+
+        elif opname == "defer":
+            addr = tokens[i]; i+=1
+            line += f"  register cleanup@{from_base12(addr)}"
+
+        elif opname == "future":
+            fn_addr = tokens[i]; i+=1
+            line += f"  future fn@{from_base12(fn_addr)}"
+
+        elif opname == "parallel":
+            fn_addr = tokens[i]; i+=1
+            line += f"  parallel fn@{from_base12(fn_addr)}"
+
+        elif opname == "sync":
+            line += "  sync all threads"
+
+        elif opname == "exit":
+            line += "  program exit"
+
+        print(line)
+    print("===================")
+
+    # ------------------------------------------------------------
+    if __name__ == "__main__":
+        if len(sys.argv) != 2:
+            print("Usage: python disassembler.py <program.dgm>")
+            sys.exit(0)
+        with open(sys.argv[1]) as f: dgm = f.read()
+        disassemble(dgm)
+        disassemble(dgm)
