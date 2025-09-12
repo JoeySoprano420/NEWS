@@ -145,3 +145,20 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+OPCODES.update({
+    "game.init": 0xC0,
+    "game.loadModel": 0xC1,
+    "game.loadTexture": 0xC2,
+    "game.createWorld": 0xC3,
+    "game.addEntity": 0xC4,
+    "game.addLight": 0xC5,
+    "game.update": 0xC6,
+    "game.render": 0xC7,
+    "game.running": 0xC8,
+    "game.input": 0xC9,
+    "game.playSound": 0xCA,
+    "game.playMusic": 0xCB,
+    "game.quit": 0xCC,
+})
+
