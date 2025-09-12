@@ -1,0 +1,56 @@
+{
+  "name": "news-nobody-ever-wins",
+  "version": "1.0.0",
+  "description": "A continuously evolving project with automated updates and improvements",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "jest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "security:audit": "npm audit",
+    "security:fix": "npm audit fix",
+    "update:deps": "npm update",
+    "prepare": "husky install"
+  },
+  "keywords": [
+    "automation",
+    "continuous-improvement",
+    "devops",
+    "ci-cd"
+  ],
+  "author": "JoeySoprano420",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JoeySoprano420/NEWS-Nobody-Ever-Wins-Sh-T-.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JoeySoprano420/NEWS-Nobody-Ever-Wins-Sh-T-/issues"
+  },
+  "homepage": "https://github.com/JoeySoprano420/NEWS-Nobody-Ever-Wins-Sh-T-#readme",
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "eslint": "^8.57.0",
+    "husky": "^8.0.3",
+    "jest": "^29.7.0",
+    "lint-staged": "^15.0.0",
+    "prettier": "^3.0.0"
+  },
+  "lint-staged": {
+    "*.{js,json,md}": [
+      "prettier --write",
+      "git add"
+    ],
+    "*.js": [
+      "eslint --fix",
+      "git add"
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  }
+}

@@ -1,0 +1,70 @@
+name: Auto Update Dependencies
+
+on:
+  schedule:
+    # Run weekly on Mondays at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Update npm dependencies
+      run: |
+        if [ -f package.json ]; then
+          npm update
+          npm audit fix
+        fi
+        
+    - name: Update GitHub Actions
+      uses: technote-space/create-pr-action@v2
+      with:
+        EXECUTE_COMMANDS: |
+          find .github/workflows -name "*.yml" -exec sed -i 's/@v[0-9]*/@v4/g' {} \;
+        COMMIT_MESSAGE: 'chore: update GitHub Actions to latest versions'
+        PR_TITLE: 'chore: update GitHub Actions dependencies'
+        PR_BODY: |
+          This PR updates GitHub Actions to their latest versions.
+          
+          This is an automated PR created by the dependency update workflow.
+
+  update-readme:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      
+    - name: Update README badges and info
+      run: |
+        # Add or update badges in README
+        if ! grep -q "![CI]" README.md; then
+          sed -i '1a\\n![CI](https://github.com/${{ github.repository }}/workflows/Continuous%20Integration/badge.svg)' README.md
+        fi
+        
+        # Update last updated date
+        if ! grep -q "Last updated:" README.md; then
+          echo -e "\n---\n*Last updated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*" >> README.md
+        else
+          sed -i "s/Last updated:.*/Last updated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")*/" README.md
+        fi
+        
+    - name: Commit changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add README.md
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "chore: update README with latest information"
+          git push
+        fi
