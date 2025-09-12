@@ -1,4 +1,12 @@
-program     ::= block ";"
-block       ::= "string:" { statement } "end()"
-statement   ::= print_stmt
-print_stmt  ::= "print" "(" STRING ")"
+program       ::= "string:" { statement } "end()" ";"
+statement     ::= print_stmt | let_stmt | add_stmt | sub_stmt 
+                 | if_stmt | while_stmt | expr_stmt
+print_stmt    ::= "print" "(" STRING ")"
+let_stmt      ::= "let" IDENT "=" NUMBER
+add_stmt      ::= "add" IDENT "," NUMBER
+sub_stmt      ::= "sub" IDENT "," NUMBER
+if_stmt       ::= "if" "(" IDENT relop NUMBER ")" block "endif"
+while_stmt    ::= "while" "(" IDENT relop NUMBER ")" block "endwhile"
+expr_stmt     ::= IDENT "=" expr
+relop         ::= "==" | "!=" | "<" | ">" | "<=" | ">="
+expr          ::= NUMBER | IDENT
