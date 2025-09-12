@@ -408,4 +408,12 @@ It may say *Nobody Ever Wins Sh*t\*, but in practice, **everyone who uses it win
 
 ---
 
+Users can now do:
+
+python news.py hello.news
+
+## _____
+
+
+
 
