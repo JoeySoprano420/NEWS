@@ -1,4 +1,2 @@
-program     ::= block ";"
-block       ::= "string:" { statement } "end()"
-statement   ::= print_stmt
-print_stmt  ::= "print" "(" STRING ")"
+program     ::= { opcode }
+opcode      ::= base12_digit | base12_pair
