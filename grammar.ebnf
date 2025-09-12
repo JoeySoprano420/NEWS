@@ -1,0 +1,4 @@
+program     ::= block ";"
+block       ::= "string:" { statement } "end()"
+statement   ::= print_stmt
+print_stmt  ::= "print" "(" STRING ")"
