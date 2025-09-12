@@ -1,0 +1,8 @@
+string:
+  print("Starting program...")
+  let x = 10
+  add x, 5
+  sub x, 3
+  print("Done!")
+end()
+;
