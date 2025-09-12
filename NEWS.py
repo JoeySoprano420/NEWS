@@ -543,4 +543,76 @@ def main():
 if __name__ == "__main__":
     main()
 
+#!/usr/bin/env python3
+"""
+NEWS Unified Compiler + VM + REPL
+---------------------------------
+ - Compile & run .news files
+ - Run .dgm bytecode
+ - Interactive REPL mode
+"""
 
+def run_news_file(infile: str):
+    with open(infile) as f: src = f.read()
+    t = Transpiler()
+    dgm_code = t.transpile(src)
+    vm = NewsVM(debug=False, trace=False)
+    vm.load_program(dgm_code)
+    vm.run()
+
+def run_dgm_file(infile: str):
+    with open(infile) as f: dgm = f.read()
+    vm = NewsVM(debug=False, trace=False)
+    vm.load_program(dgm)
+    vm.run()
+
+def start_repl():
+    print("NEWS REPL (Nobody Ever Wins Sh*t)")
+    print("Type NEWS code, 'quit' to exit. Multiline blocks supported (if/while/match).")
+
+    t = Transpiler()
+    vm = NewsVM(debug=False, trace=False)
+
+    buffer = []
+    block_keywords = ("if ", "while ", "match ")
+    end_keywords = ("endif", "endwhile", "endmatch")
+
+    while True:
+        try:
+            prompt = ">>> " if not buffer else "... "
+            line = input(prompt).strip()
+            if not line: continue
+            if line == "quit": break
+
+            # handle blocks
+            buffer.append(line)
+            if any(line.startswith(end) for end in end_keywords) or not any(line.startswith(b) for b in block_keywords):
+                # compile and execute
+                src = "\n".join(buffer)
+                buffer.clear()
+                try:
+                    dgm_code = t.transpile(src)
+                    vm.load_program(dgm_code)
+                    vm.run()
+                except Exception as e:
+                    print(f"[ERROR] {e}")
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting REPL.")
+            break
+
+def main():
+    if len(sys.argv) == 1:
+        start_repl()
+    elif len(sys.argv) == 2:
+        infile = sys.argv[1]
+        if infile.endswith(".news"):
+            run_news_file(infile)
+        elif infile.endswith(".dgm"):
+            run_dgm_file(infile)
+        else:
+            print("Error: expected .news or .dgm file")
+    else:
+        print("Usage: python news.py [program.news | program.dgm]")
+
+if __name__ == "__main__":
+    main()
