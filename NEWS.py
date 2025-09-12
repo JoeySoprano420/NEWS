@@ -8,7 +8,7 @@ Single tool to:
  - Or compile+execute .news directly (no file out)
 """
 
-import sys, os
+import sys
 from transpiler import Transpiler, to_base12, from_base12, OPCODES
 from vm import NewsVM
 
