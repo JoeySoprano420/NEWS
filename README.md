@@ -1,6 +1,8 @@
-# NEWS-Nobody-Ever-Wins-Sh-T-
+![download](https://github.com/user-attachments/assets/ef58457f-f0ac-4333-90d8-5a69fac6270d)
+  
+  
 
-## 🔹 5. Example Full Pipeline
+
 
 NEWS Source:
 
