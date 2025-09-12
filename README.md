@@ -414,6 +414,24 @@ python news.py hello.news
 
 ## _____
 
+🔹 Design of NEWS REPL
 
+Start by launching with no arguments:
+
+python news.py
+
+
+→ Drop into an interactive prompt:
+
+NEWS REPL (Nobody Ever Wins Sh*t)
+>>> let x = 5
+>>> add x, 3
+>>> print("x is:")
+>>> print("done")
+
+
+Each line is transpiled into DGM bytecode, then executed immediately in the same VM instance (so memory, variables, and lists persist).
+
+Multi-line blocks (if/endif, while/endwhile, match/endmatch) are buffered until closed.
 
 
