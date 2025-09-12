@@ -1,0 +1,8 @@
+string:
+  let x = 3
+  while(x > 0)
+    print("Loop")
+    sub x, 1
+  endwhile
+end()
+;
