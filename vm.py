@@ -1,6 +1,75 @@
 # vm.py
 import sys
 from transpiler import Transpiler
+from transpiler import from_base12
+from transpiler import to_base12
+from transpiler import OPCODES
+from transpiler import DIGITS
+from transpiler import Transpiler
+import re
+import sys
+from typing import List, Dict
+from io import StringIO
+from collections import defaultdict
+import random
+import string
+import time
+import os
+import math
+import json
+import base64
+import struct
+import hashlib
+import itertools
+import functools
+import operator
+import threading
+import queue
+import subprocess
+import shlex
+import traceback
+import ast
+import inspect
+import contextlib
+import copy
+import types
+import pickle
+import zlib
+import lzma
+import bz2
+import gzip
+import sqlite3
+import http.client
+import urllib.request
+import urllib.parse
+import socket
+import ssl
+import email
+import xml.etree.ElementTree as ET
+import csv
+import configparser
+import difflib
+import enum
+import locale
+import platform
+import shutil
+import tempfile
+import unittest
+import warnings
+import webbrowser
+import zipfile
+import tarfile
+import fnmatch
+import importlib
+import importlib.util
+import importlib.machinery
+import pkgutil
+import site
+import venv
+import ensurepip
+import pip
+import sys
+from transpiler import Transpiler
 
 DIGITS = "0123456789ab"
 def from_base12(s: str) -> int:
@@ -97,75 +166,6 @@ def main():
 
 if __name__=="__main__": main()
 # vm.py
-import sys
-from transpiler import Transpiler
-from transpiler import from_base12
-from transpiler import to_base12
-from transpiler import OPCODES
-from transpiler import DIGITS
-from transpiler import Transpiler
-import re
-import sys
-from typing import List, Dict
-from io import StringIO
-from collections import defaultdict
-import random
-import string
-import time
-import os
-import math
-import json
-import base64
-import struct
-import hashlib
-import itertools
-import functools
-import operator
-import threading
-import queue
-import subprocess
-import shlex
-import traceback
-import ast
-import inspect
-import contextlib
-import copy
-import types
-import pickle
-import zlib
-import lzma
-import bz2
-import gzip
-import sqlite3
-import http.client
-import urllib.request
-import urllib.parse
-import socket
-import ssl
-import email
-import xml.etree.ElementTree as ET
-import csv
-import configparser
-import difflib
-import enum
-import locale
-import platform
-import shutil
-import tempfile
-import unittest
-import warnings
-import webbrowser
-import zipfile
-import tarfile
-import fnmatch
-import importlib
-import importlib.util
-import importlib.machinery
-import pkgutil
-import site
-import venv
-import ensurepip
-import pip
 
 DIGITS = "0123456789ab"
 def from_base12(s: str) -> int:
