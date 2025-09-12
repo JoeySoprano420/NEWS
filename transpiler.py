@@ -4,7 +4,6 @@ import sys, re
 DIGITS = "0123456789ab"
 
 def to_base12(num: int) -> str:
-    """Convert integer to base-12 string."""
     if num == 0:
         return "0"
     result = []
@@ -13,70 +12,124 @@ def to_base12(num: int) -> str:
         num //= 12
     return "".join(reversed(result))
 
-# NEWS → DGM opcode map
 OPCODES = {
     "print": 0xA6,
     "ret":   0x33,
-    "let":   0x01,
     "store": 0x03,
-    "load":  0x02,
     "add":   0x17,
     "sub":   0x18,
     "icmp":  0x15,
     "br":    0x30,
+    "match.begin": 0x95,
+    "match.case":  0x96,
+    "match.end":   0x97,
 }
 
-def transpile(src: str) -> str:
-    tokens = []
-    variables = {}  # map var -> memory index
-    mem_index = 1
+REL_OPS = {
+    "==": "eq", "!=": "ne", "<": "lt", ">": "gt", "<=": "le", ">=": "ge"
+}
 
-    lines = [l.strip() for l in src.splitlines() if l.strip()]
-    for line in lines:
-        if line.startswith("print("):
-            # print string
-            text = re.match(r'print\("(.*)"\)', line).group(1)
-            tokens.append(to_base12(OPCODES["print"]))
-            for ch in text:
-                tokens.append(to_base12(ord(ch)))
-            tokens.append("0")  # null terminator
+class Transpiler:
+    def __init__(self):
+        self.tokens = []
+        self.variables = {}
+        self.mem_index = 1
+        self.labels = {}
+        self.fixups = []
 
-        elif line.startswith("let "):
+    def add(self, val):
+        self.tokens.append(to_base12(val) if isinstance(val, int) else val)
+
+    def define_var(self, name):
+        if name not in self.variables:
+            self.variables[name] = self.mem_index
+            self.mem_index += 1
+        return self.variables[name]
+
+    def transpile(self, src: str) -> str:
+        lines = [l.strip() for l in src.splitlines() if l.strip()]
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # print("...")
+            if line.startswith("print("):
+                text = re.match(r'print\("(.*)"\)', line).group(1)
+                self.add(OPCODES["print"])
+                for ch in text:
+                    self.add(ord(ch))
+                self.add(0)
+
             # let x = N
-            match = re.match(r'let (\w+) *= *(\d+)', line)
-            var, num = match.groups()
-            if var not in variables:
-                variables[var] = mem_index
-                mem_index += 1
-            addr = variables[var]
-            tokens.append(to_base12(OPCODES["store"]))
-            tokens.append(to_base12(addr))
-            tokens.append(to_base12(int(num)))
+            elif line.startswith("let "):
+                m = re.match(r'let (\w+) *= *(\d+)', line)
+                var, num = m.groups()
+                addr = self.define_var(var)
+                self.add(OPCODES["store"]); self.add(addr); self.add(int(num))
 
-        elif line.startswith("add "):
-            # add x, 5
-            match = re.match(r'add (\w+), *(\d+)', line)
-            var, num = match.groups()
-            addr = variables[var]
-            tokens.append(to_base12(OPCODES["add"]))
-            tokens.append(to_base12(addr))
-            tokens.append(to_base12(int(num)))
+            # add/sub
+            elif line.startswith("add "):
+                m = re.match(r'add (\w+), *(\d+)', line)
+                addr = self.define_var(m.group(1))
+                self.add(OPCODES["add"]); self.add(addr); self.add(int(m.group(2)))
+            elif line.startswith("sub "):
+                m = re.match(r'sub (\w+), *(\d+)', line)
+                addr = self.define_var(m.group(1))
+                self.add(OPCODES["sub"]); self.add(addr); self.add(int(m.group(2)))
 
-        elif line.startswith("sub "):
-            match = re.match(r'sub (\w+), *(\d+)', line)
-            var, num = match.groups()
-            addr = variables[var]
-            tokens.append(to_base12(OPCODES["sub"]))
-            tokens.append(to_base12(addr))
-            tokens.append(to_base12(int(num)))
+            # if (...)
+            elif line.startswith("if "):
+                m = re.match(r'if\s*\(\s*(\w+)\s*([=!<>]+)\s*(\d+)\s*\)', line)
+                var, op, num = m.groups()
+                addr = self.define_var(var)
+                self.add(OPCODES["icmp"]); self.add(addr); self.add(int(num)); self.add(op)
+                # reserve jump placeholder
+                self.fixups.append(("if_end", len(self.tokens)))
+                self.add("FIXUP")
 
-        elif line.startswith("end()"):
-            tokens.append(to_base12(OPCODES["ret"]))
+            elif line.startswith("endif"):
+                for idx, (kind, pos) in enumerate(self.fixups):
+                    if kind == "if_end" and self.tokens[pos] == "FIXUP":
+                        self.tokens[pos] = to_base12(len(self.tokens))
+                        self.fixups.pop(idx); break
 
-        else:
-            raise SyntaxError(f"Unrecognized statement: {line}")
+            # while (...)
+            elif line.startswith("while "):
+                m = re.match(r'while\s*\(\s*(\w+)\s*([=!<>]+)\s*(\d+)\s*\)', line)
+                var, op, num = m.groups()
+                loop_start = len(self.tokens)
+                addr = self.define_var(var)
+                self.add(OPCODES["icmp"]); self.add(addr); self.add(int(num)); self.add(op)
+                self.fixups.append(("while_end", len(self.tokens), loop_start))
+                self.add("FIXUP")
 
-    return " ".join(tokens)
+            elif line.startswith("endwhile"):
+                kind, pos, loop_start = self.fixups.pop()
+                self.tokens[pos] = to_base12(len(self.tokens)+2)
+                self.add(OPCODES["br"]); self.add(loop_start)
+
+            # match x
+            elif line.startswith("match "):
+                var = line.split()[1]
+                addr = self.define_var(var)
+                self.add(OPCODES["match.begin"]); self.add(addr)
+
+            elif line.startswith("case "):
+                val = int(line.split()[1].strip(":"))
+                self.add(OPCODES["match.case"]); self.add(val)
+
+            elif line.startswith("endmatch"):
+                self.add(OPCODES["match.end"])
+
+            # end()
+            elif line.startswith("end()"):
+                self.add(OPCODES["ret"])
+
+            else:
+                raise SyntaxError(f"Unrecognized: {line}")
+            i += 1
+
+        return " ".join(self.tokens)
 
 def main():
     if len(sys.argv) != 3:
@@ -84,13 +137,10 @@ def main():
         sys.exit(1)
 
     infile, outfile = sys.argv[1], sys.argv[2]
-    with open(infile, "r", encoding="utf-8") as f:
-        src = f.read()
-
-    dgm_code = transpile(src)
-    with open(outfile, "w", encoding="utf-8") as f:
-        f.write(dgm_code)
-
+    with open(infile) as f: src = f.read()
+    t = Transpiler()
+    dgm_code = t.transpile(src)
+    with open(outfile, "w") as f: f.write(dgm_code)
     print(f"Transpiled {infile} → {outfile}")
 
 if __name__ == "__main__":
