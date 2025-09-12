@@ -19,3 +19,15 @@ while(game.running())
 endwhile
 
 end()
+
+game.init(800, 600, "NEWS Engine Demo")
+
+let world = game.createWorld()
+
+while(game.running())
+    game.update()
+    game.render(world)
+endwhile
+
+game.quit()
+end()
