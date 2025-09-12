@@ -1,0 +1,21 @@
+# Initialize engine
+game.init(1280, 720, "My AAA Game")
+
+# Load assets
+let player = game.loadModel("assets/player.obj")
+let tex = game.loadTexture("assets/grass.png")
+
+# Create world
+let world = game.createWorld()
+
+# Add entities
+game.addEntity(world, player, 0,0,0)
+game.addLight(world, 10,20,10, "white")
+
+# Game loop
+while(game.running())
+    game.update()
+    game.render(world)
+endwhile
+
+end()
