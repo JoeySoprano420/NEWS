@@ -788,3 +788,32 @@ def disassemble(dgm_code: str):
     "game.playMusic": 0xCB,
     "game.quit": 0xCC,
 })
+
+        def main():
+            if len(sys.argv) != 2:
+                print("Usage: python disassembler.py <program.dgm>")
+                sys.exit(0)
+            with open(sys.argv[1]) as f: dgm = f.read()
+            disassemble(dgm)
+            if __name__ == "__main__":
+                main()
+                disassemble(dgm)
+                if opname.startswith("game."):
+                    args = []
+                    if opname in ("game.loadModel", "game.loadTexture"):
+                        fname = []
+                        while i < len(tokens):
+                            v = from_base12(tokens[i]); i+=1
+                            if v == 0: break
+                            fname.append(chr(v))
+                        args.append(f"'{''.join(fname)}'")
+                    elif opname in ("game.addEntity", "game.addLight"):
+                        model_id = tokens[i]; i+=1
+                        args.append(f"model@{from_base12(model_id)}")
+                    elif opname in ("game.playSound", "game.playMusic"):
+                        sound_id = tokens[i]; i+=1
+                        args.append(f"sound@{from_base12(sound_id)}")
+                    line += "  " + ", ".join(args)
+                    print(line)
+                    print("===================")
+
