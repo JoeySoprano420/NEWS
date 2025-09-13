@@ -1,12 +1,10 @@
 # transpiler.py
-import sys
-import re
+import sys, re
 
-# Base-12 encoding table (0-11 → 0-9, a, b)
 DIGITS = "0123456789ab"
 
 def to_base12(num: int) -> str:
-    """Convert integer opcode into base-12 representation."""
+    """Convert integer to base-12 string."""
     if num == 0:
         return "0"
     result = []
@@ -15,36 +13,70 @@ def to_base12(num: int) -> str:
         num //= 12
     return "".join(reversed(result))
 
-# NEWS → DGM opcode mapping (minimal for now)
-NEWS_OPCODES = {
-    "print": 0xA6,     # language.echo
-    "end":   0x33,     # ret
+# NEWS → DGM opcode map
+OPCODES = {
+    "print": 0xA6,
+    "ret":   0x33,
+    "let":   0x01,
+    "store": 0x03,
+    "load":  0x02,
+    "add":   0x17,
+    "sub":   0x18,
+    "icmp":  0x15,
+    "br":    0x30,
 }
 
-def transpile(news_code: str) -> str:
-    """Transpile NEWS source code into DGM opcodes (base-12)."""
-    dgm_tokens = []
+def transpile(src: str) -> str:
+    tokens = []
+    variables = {}  # map var -> memory index
+    mem_index = 1
 
-    # Match print("...") lines
-    for line in news_code.splitlines():
-        line = line.strip()
+    lines = [l.strip() for l in src.splitlines() if l.strip()]
+    for line in lines:
         if line.startswith("print("):
-            # Extract string literal
-            match = re.match(r'print\s*\("(.*)"\)', line)
-            if not match:
-                raise SyntaxError(f"Invalid print syntax: {line}")
-            text = match.group(1)
-            # Opcode for print
-            dgm_tokens.append(to_base12(NEWS_OPCODES["print"]))
-            # Encode string as ASCII codes
+            # print string
+            text = re.match(r'print\("(.*)"\)', line).group(1)
+            tokens.append(to_base12(OPCODES["print"]))
             for ch in text:
-                dgm_tokens.append(to_base12(ord(ch)))
-            # Null terminator
-            dgm_tokens.append("0")
-        elif line.startswith("end()"):
-            dgm_tokens.append(to_base12(NEWS_OPCODES["end"]))
+                tokens.append(to_base12(ord(ch)))
+            tokens.append("0")  # null terminator
 
-    return " ".join(dgm_tokens)
+        elif line.startswith("let "):
+            # let x = N
+            match = re.match(r'let (\w+) *= *(\d+)', line)
+            var, num = match.groups()
+            if var not in variables:
+                variables[var] = mem_index
+                mem_index += 1
+            addr = variables[var]
+            tokens.append(to_base12(OPCODES["store"]))
+            tokens.append(to_base12(addr))
+            tokens.append(to_base12(int(num)))
+
+        elif line.startswith("add "):
+            # add x, 5
+            match = re.match(r'add (\w+), *(\d+)', line)
+            var, num = match.groups()
+            addr = variables[var]
+            tokens.append(to_base12(OPCODES["add"]))
+            tokens.append(to_base12(addr))
+            tokens.append(to_base12(int(num)))
+
+        elif line.startswith("sub "):
+            match = re.match(r'sub (\w+), *(\d+)', line)
+            var, num = match.groups()
+            addr = variables[var]
+            tokens.append(to_base12(OPCODES["sub"]))
+            tokens.append(to_base12(addr))
+            tokens.append(to_base12(int(num)))
+
+        elif line.startswith("end()"):
+            tokens.append(to_base12(OPCODES["ret"]))
+
+        else:
+            raise SyntaxError(f"Unrecognized statement: {line}")
+
+    return " ".join(tokens)
 
 def main():
     if len(sys.argv) != 3:
