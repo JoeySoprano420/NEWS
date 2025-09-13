@@ -4,7 +4,6 @@ import sys
 DIGITS = "0123456789ab"
 
 def from_base12(s: str) -> int:
-    """Convert base-12 string to int."""
     value = 0
     for ch in s:
         value = value * 12 + DIGITS.index(ch)
@@ -13,21 +12,38 @@ def from_base12(s: str) -> int:
 def run_dgm(dgm_code: str):
     tokens = dgm_code.strip().split()
     ip = 0
+    memory = {}
+
     while ip < len(tokens):
         opcode = from_base12(tokens[ip])
         ip += 1
 
-        if opcode == 0xA6:  # language.echo
+        if opcode == 0xA6:  # print string
             chars = []
             while ip < len(tokens):
-                val = from_base12(tokens[ip])
-                ip += 1
-                if val == 0:
-                    break
+                val = from_base12(tokens[ip]); ip += 1
+                if val == 0: break
                 chars.append(chr(val))
             print("".join(chars))
+
+        elif opcode == 0x03:  # store addr value
+            addr = from_base12(tokens[ip]); ip += 1
+            val = from_base12(tokens[ip]); ip += 1
+            memory[addr] = val
+
+        elif opcode == 0x17:  # add addr value
+            addr = from_base12(tokens[ip]); ip += 1
+            val = from_base12(tokens[ip]); ip += 1
+            memory[addr] = memory.get(addr, 0) + val
+
+        elif opcode == 0x18:  # sub addr value
+            addr = from_base12(tokens[ip]); ip += 1
+            val = from_base12(tokens[ip]); ip += 1
+            memory[addr] = memory.get(addr, 0) - val
+
         elif opcode == 0x33:  # ret
             return
+
         else:
             raise ValueError(f"Unknown opcode: {opcode}")
 
